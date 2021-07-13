@@ -13,11 +13,15 @@ import (
 	"github.com/pkg/errors"
 
 	"github.com/kopia/kopia/internal/clock"
+	"github.com/kopia/kopia/repo/compression"
 	"github.com/kopia/kopia/repo/content"
 	"github.com/kopia/kopia/repo/logging"
 )
 
-const manifestLoadParallelism = 8
+const (
+	manifestLoadParallelism = 8
+	manifestIDLength        = 16
+)
 
 var log = logging.GetContextLoggerFunc("kopia/manifest")
 
@@ -36,7 +40,7 @@ const TypeLabelKey = "type"
 type contentManager interface {
 	Revision() int64
 	GetContent(ctx context.Context, contentID content.ID) ([]byte, error)
-	WriteContent(ctx context.Context, data []byte, prefix content.ID) (content.ID, error)
+	WriteContent(ctx context.Context, data []byte, prefix content.ID, comp compression.HeaderID) (content.ID, error)
 	DeleteContent(ctx context.Context, contentID content.ID) error
 	IterateContents(ctx context.Context, options content.IterateOptions, callback content.IterateCallback) error
 	DisableIndexFlush(ctx context.Context)
@@ -65,7 +69,7 @@ func (m *Manager) Put(ctx context.Context, labels map[string]string, payload int
 		return "", errors.Errorf("'type' label is required")
 	}
 
-	random := make([]byte, 16)
+	random := make([]byte, manifestIDLength)
 	if _, err := rand.Read(random); err != nil {
 		return "", errors.Wrap(err, "can't initialize randomness")
 	}

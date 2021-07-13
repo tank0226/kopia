@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	"golang.org/x/sync/errgroup"
 )
 
 // ErrSetTimeUnsupported is returned by implementations of Storage that don't support SetTime.
@@ -74,6 +75,9 @@ type Storage interface {
 
 	// Close releases all resources associated with storage.
 	Close(ctx context.Context) error
+
+	// FlushCaches flushes any local caches associated with storage.
+	FlushCaches(ctx context.Context) error
 }
 
 // ID is a string that represents blob identifier.
@@ -109,6 +113,7 @@ func ListAllBlobs(ctx context.Context, st Storage, prefix ID) ([]Metadata, error
 // IterateAllPrefixesInParallel invokes the provided callback and returns the first error returned by the callback or nil.
 func IterateAllPrefixesInParallel(ctx context.Context, parallelism int, st Storage, prefixes []ID, callback func(Metadata) error) error {
 	if len(prefixes) == 1 {
+		// nolint:wrapcheck
 		return st.ListBlobs(ctx, prefixes[0], callback)
 	}
 
@@ -176,4 +181,75 @@ func EnsureLengthAndTruncate(b []byte, length int64) ([]byte, error) {
 	}
 
 	return b[0:length], nil
+}
+
+// IDsFromMetadata returns IDs for blobs in Metadata slice.
+func IDsFromMetadata(mds []Metadata) []ID {
+	ids := make([]ID, len(mds))
+
+	for i, md := range mds {
+		ids[i] = md.BlobID
+	}
+
+	return ids
+}
+
+// TotalLength returns minimum timestamp for blobs in Metadata slice.
+func TotalLength(mds []Metadata) int64 {
+	var total int64
+
+	for _, md := range mds {
+		total += md.Length
+	}
+
+	return total
+}
+
+// MinTimestamp returns minimum timestamp for blobs in Metadata slice.
+func MinTimestamp(mds []Metadata) time.Time {
+	min := time.Time{}
+
+	for _, md := range mds {
+		if min.IsZero() || md.Timestamp.Before(min) {
+			min = md.Timestamp
+		}
+	}
+
+	return min
+}
+
+// MaxTimestamp returns maxinum timestamp for blobs in Metadata slice.
+func MaxTimestamp(mds []Metadata) time.Time {
+	max := time.Time{}
+
+	for _, md := range mds {
+		if md.Timestamp.After(max) {
+			max = md.Timestamp
+		}
+	}
+
+	return max
+}
+
+// DeleteMultiple deletes multiple blobs in parallel.
+func DeleteMultiple(ctx context.Context, st Storage, ids []ID, parallelism int) error {
+	eg, ctx := errgroup.WithContext(ctx)
+	sem := make(chan struct{}, parallelism)
+
+	for _, id := range ids {
+		// acquire semaphore
+		sem <- struct{}{}
+
+		id := id
+
+		eg.Go(func() error {
+			defer func() {
+				<-sem // release semaphore
+			}()
+
+			return errors.Wrapf(st.DeleteBlob(ctx, id), "deleting %v", id)
+		})
+	}
+
+	return errors.Wrap(eg.Wait(), "error deleting blobs")
 }

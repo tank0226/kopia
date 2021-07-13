@@ -8,22 +8,41 @@ import (
 
 	"github.com/kopia/kopia/internal/stats"
 	"github.com/kopia/kopia/repo"
+	"github.com/kopia/kopia/repo/compression"
 	"github.com/kopia/kopia/repo/content"
 )
 
-var (
-	contentListCommand        = contentCommands.Command("list", "List contents").Alias("ls")
-	contentListLong           = contentListCommand.Flag("long", "Long output").Short('l').Bool()
-	contentListIncludeDeleted = contentListCommand.Flag("deleted", "Include deleted content").Bool()
-	contentListDeletedOnly    = contentListCommand.Flag("deleted-only", "Only show deleted content").Bool()
-	contentListSummary        = contentListCommand.Flag("summary", "Summarize the list").Short('s').Bool()
-	contentListHuman          = contentListCommand.Flag("human", "Human-readable output").Short('h').Bool()
-)
+type commandContentList struct {
+	long           bool
+	includeDeleted bool
+	deletedOnly    bool
+	summary        bool
+	human          bool
+	compression    bool
 
-func runContentListCommand(ctx context.Context, rep repo.DirectRepository) error {
+	contentRange contentRangeFlags
+	jo           jsonOutput
+	out          textOutput
+}
+
+func (c *commandContentList) setup(svc appServices, parent commandParent) {
+	cmd := parent.Command("list", "List contents").Alias("ls")
+	cmd.Flag("long", "Long output").Short('l').BoolVar(&c.long)
+	cmd.Flag("compression", "Compression").Short('c').BoolVar(&c.compression)
+	cmd.Flag("deleted", "Include deleted content").BoolVar(&c.includeDeleted)
+	cmd.Flag("deleted-only", "Only show deleted content").BoolVar(&c.deletedOnly)
+	cmd.Flag("summary", "Summarize the list").Short('s').BoolVar(&c.summary)
+	cmd.Flag("human", "Human-readable output").Short('h').BoolVar(&c.human)
+	c.contentRange.setup(cmd)
+	c.jo.setup(svc, cmd)
+	c.out.setup(svc)
+	cmd.Action(svc.directRepositoryReadAction(c.run))
+}
+
+func (c *commandContentList) run(ctx context.Context, rep repo.DirectRepository) error {
 	var jl jsonList
 
-	jl.begin()
+	jl.begin(&c.jo)
 	defer jl.end()
 
 	var totalSize stats.CountSum
@@ -31,35 +50,25 @@ func runContentListCommand(ctx context.Context, rep repo.DirectRepository) error
 	err := rep.ContentReader().IterateContents(
 		ctx,
 		content.IterateOptions{
-			Range:          contentIDRange(),
-			IncludeDeleted: *contentListIncludeDeleted || *contentListDeletedOnly,
+			Range:          c.contentRange.contentIDRange(),
+			IncludeDeleted: c.includeDeleted || c.deletedOnly,
 		},
 		func(b content.Info) error {
-			if *contentListDeletedOnly && !b.Deleted {
+			if c.deletedOnly && !b.GetDeleted() {
 				return nil
 			}
 
-			totalSize.Add(int64(b.PackedLength))
+			totalSize.Add(int64(b.GetPackedLength()))
 
-			if jsonOutput {
+			switch {
+			case c.jo.jsonOutput:
 				jl.emit(b)
-				return nil
-			}
-
-			if *contentListLong {
-				optionalDeleted := ""
-				if b.Deleted {
-					optionalDeleted = " (deleted)"
-				}
-				fmt.Printf("%v %v %v %v+%v%v\n",
-					b.ID,
-					formatTimestamp(b.Timestamp()),
-					b.PackBlobID,
-					b.PackOffset,
-					maybeHumanReadableBytes(*contentListHuman, int64(b.PackedLength)),
-					optionalDeleted)
-			} else {
-				fmt.Printf("%v\n", b.ID)
+			case c.compression:
+				c.outputCompressed(b)
+			case c.long:
+				c.outputLong(b)
+			default:
+				c.out.printStdout("%v\n", b.GetContentID())
 			}
 
 			return nil
@@ -68,18 +77,61 @@ func runContentListCommand(ctx context.Context, rep repo.DirectRepository) error
 		return errors.Wrap(err, "error iterating")
 	}
 
-	if *contentListSummary {
+	if c.summary {
 		count, sz := totalSize.Approximate()
-		fmt.Printf("Total: %v contents, %v total size\n",
-			maybeHumanReadableCount(*contentListHuman, int64(count)),
-			maybeHumanReadableBytes(*contentListHuman, sz))
+		c.out.printStdout("Total: %v contents, %v total size\n",
+			maybeHumanReadableCount(c.human, int64(count)),
+			maybeHumanReadableBytes(c.human, sz))
 	}
 
 	return nil
 }
 
-func init() {
-	registerJSONOutputFlags(contentListCommand)
-	contentListCommand.Action(directRepositoryReadAction(runContentListCommand))
-	setupContentIDRangeFlags(contentListCommand)
+func (c *commandContentList) outputLong(b content.Info) {
+	c.out.printStdout("%v %v %v %v %v+%v%v %v\n",
+		b.GetContentID(),
+		b.GetOriginalLength(),
+		formatTimestamp(b.Timestamp()),
+		b.GetPackBlobID(),
+		b.GetPackOffset(),
+		maybeHumanReadableBytes(c.human, int64(b.GetPackedLength())),
+		c.deletedInfoString(b),
+		c.compressionInfoStringString(b),
+	)
+}
+
+func (c *commandContentList) outputCompressed(b content.Info) {
+	c.out.printStdout("%v length %v packed %v %v %v\n",
+		b.GetContentID(),
+		maybeHumanReadableBytes(c.human, int64(b.GetOriginalLength())),
+		maybeHumanReadableBytes(c.human, int64(b.GetPackedLength())),
+		c.compressionInfoStringString(b),
+		c.deletedInfoString(b),
+	)
+}
+
+func (*commandContentList) deletedInfoString(b content.Info) string {
+	if b.GetDeleted() {
+		return " (deleted)"
+	}
+
+	return ""
+}
+
+func (*commandContentList) compressionInfoStringString(b content.Info) string {
+	h := b.GetCompressionHeaderID()
+	if h == content.NoCompression {
+		return "-"
+	}
+
+	s := string(compression.HeaderIDToName[h])
+	if s == "" {
+		s = fmt.Sprintf("compression-%x", h)
+	}
+
+	if b.GetOriginalLength() > 0 {
+		s += " " + formatCompressionPercentage(int64(b.GetOriginalLength()), int64(b.GetPackedLength()))
+	}
+
+	return s
 }

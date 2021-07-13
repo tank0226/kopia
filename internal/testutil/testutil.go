@@ -1,8 +1,10 @@
 package testutil
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -21,26 +23,26 @@ func ProviderTest(t *testing.T) {
 
 // TestSkipUnlessCI skips the current test with a provided message, except when running
 // in CI environment, in which case it causes hard failure.
-func TestSkipUnlessCI(t *testing.T, msg string, args ...interface{}) {
-	t.Helper()
+func TestSkipUnlessCI(tb testing.TB, msg string, args ...interface{}) {
+	tb.Helper()
 
 	if len(args) > 0 {
 		msg = fmt.Sprintf(msg, args...)
 	}
 
 	if os.Getenv("CI") != "" {
-		t.Fatal(msg)
+		tb.Fatal(msg)
 	} else {
-		t.Skip(msg)
+		tb.Skip(msg)
 	}
 }
 
 // TestSkipOnCIUnlessLinuxAMD64 skips the current test if running on CI unless the environment is Linux/AMD64.
-func TestSkipOnCIUnlessLinuxAMD64(t *testing.T) {
-	t.Helper()
+func TestSkipOnCIUnlessLinuxAMD64(tb testing.TB) {
+	tb.Helper()
 
 	if os.Getenv("CI") != "" && runtime.GOOS+"/"+runtime.GOARCH != "linux/amd64" {
-		t.Skip("test not supported in this environment.")
+		tb.Skip("test not supported in this environment.")
 	}
 }
 
@@ -66,4 +68,35 @@ func MyTestMain(m *testing.M) {
 	}
 
 	os.Exit(v)
+}
+
+// MustParseJSONLines parses the lines containing JSON into the provided object.
+func MustParseJSONLines(t *testing.T, lines []string, v interface{}) {
+	t.Helper()
+
+	allJSON := strings.Join(lines, "\n")
+	dec := json.NewDecoder(strings.NewReader(allJSON))
+	dec.DisallowUnknownFields()
+
+	if err := dec.Decode(v); err != nil {
+		t.Fatalf("failed to parse JSON %v: %v", allJSON, err)
+	}
+}
+
+// RunAllTestsWithParam uses reflection to run all test methods starting with 'Test' on the provided object.
+// nolint:thelper
+func RunAllTestsWithParam(t *testing.T, v interface{}) {
+	m := reflect.ValueOf(v)
+	typ := m.Type()
+
+	for i := 0; i < typ.NumMethod(); i++ {
+		i := i
+		meth := typ.Method(i)
+
+		if strings.HasPrefix(meth.Name, "Test") {
+			t.Run(meth.Name, func(t *testing.T) {
+				m.Method(i).Call([]reflect.Value{reflect.ValueOf(t)})
+			})
+		}
+	}
 }

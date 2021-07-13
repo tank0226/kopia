@@ -13,12 +13,15 @@ import (
 
 const aes256GCMHmacSha256Overhead = 28
 
+const aes256KeyDerivationSecretSize = 32
+
 type aes256GCMHmacSha256 struct {
 	hmacPool *sync.Pool
 }
 
 // aeadForContent returns cipher.AEAD using key derived from a given contentID.
 func (e aes256GCMHmacSha256) aeadForContent(contentID []byte) (cipher.AEAD, error) {
+	// nolint:forcetypeassert
 	h := e.hmacPool.Get().(hash.Hash)
 	defer e.hmacPool.Put(h)
 	h.Reset()
@@ -35,6 +38,7 @@ func (e aes256GCMHmacSha256) aeadForContent(contentID []byte) (cipher.AEAD, erro
 		return nil, errors.Wrap(err, "unable to create AES-256 cipher")
 	}
 
+	// nolint:wrapcheck
 	return cipher.NewGCM(c)
 }
 
@@ -62,7 +66,7 @@ func (e aes256GCMHmacSha256) Overhead() int {
 
 func init() {
 	Register("AES256-GCM-HMAC-SHA256", "AES-256-GCM using per-content key generated using HMAC-SHA256", false, func(p Parameters) (Encryptor, error) {
-		keyDerivationSecret, err := deriveKey(p, []byte(purposeEncryptionKey), 32)
+		keyDerivationSecret, err := deriveKey(p, []byte(purposeEncryptionKey), aes256KeyDerivationSecretSize)
 		if err != nil {
 			return nil, err
 		}

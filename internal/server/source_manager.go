@@ -110,12 +110,12 @@ func (s *sourceManager) run(ctx context.Context) {
 	s.wg.Add(1)
 	defer s.wg.Done()
 
-	if s.server.rep.ClientOptions().Hostname == s.src.Host {
+	if s.server.rep.ClientOptions().Hostname == s.src.Host && !s.server.rep.ClientOptions().ReadOnly {
 		log(ctx).Debugf("starting local source manager for %v", s.src)
 		s.runLocal(ctx)
 	} else {
-		log(ctx).Debugf("starting remote source manager for %v", s.src)
-		s.runRemote(ctx)
+		log(ctx).Debugf("starting read-only source manager for %v", s.src)
+		s.runReadOnly(ctx)
 	}
 }
 
@@ -168,7 +168,7 @@ func (s *sourceManager) backoffBeforeNextSnapshot() {
 	s.nextSnapshotTime = &t
 }
 
-func (s *sourceManager) runRemote(ctx context.Context) {
+func (s *sourceManager) runReadOnly(ctx context.Context) {
 	s.refreshStatus(ctx)
 	s.setStatus("REMOTE")
 
@@ -229,6 +229,7 @@ func (s *sourceManager) snapshot(ctx context.Context) error {
 	s.server.beginUpload(ctx, s.src)
 	defer s.server.endUpload(ctx, s.src)
 
+	// nolint:wrapcheck
 	return s.server.taskmgr.Run(ctx,
 		"Snapshot",
 		fmt.Sprintf("%v at %v", s.src, clock.Now().Format(time.RFC3339)),
@@ -258,6 +259,7 @@ func (s *sourceManager) snapshotInternal(ctx context.Context, ctrl uitask.Contro
 
 	onUpload := func(int64) {}
 
+	// nolint:wrapcheck
 	return repo.WriteSession(ctx, s.server.rep, repo.WriteSessionOptions{
 		Purpose: "Source Manager Uploader",
 		OnUpload: func(numBytes int64) {
@@ -265,7 +267,7 @@ func (s *sourceManager) snapshotInternal(ctx context.Context, ctrl uitask.Contro
 			// once we have the uploader
 			onUpload(numBytes)
 		},
-	}, func(w repo.RepositoryWriter) error {
+	}, func(ctx context.Context, w repo.RepositoryWriter) error {
 		log(ctx).Debugf("uploading %v", s.src)
 		u := snapshotfs.NewUploader(w)
 

@@ -156,18 +156,6 @@ func TestHMAC(t *testing.T) {
 	}
 }
 
-func TestUpgrade(t *testing.T) {
-	ctx, env := repotesting.NewEnvironment(t)
-
-	if err := env.RepositoryWriter.Upgrade(ctx); err != nil {
-		t.Errorf("upgrade error: %v", err)
-	}
-
-	if err := env.RepositoryWriter.Upgrade(ctx); err != nil {
-		t.Errorf("2nd upgrade error: %v", err)
-	}
-}
-
 func TestReaderStoredBlockNotFound(t *testing.T) {
 	ctx, env := repotesting.NewEnvironment(t)
 
@@ -313,17 +301,17 @@ func TestWriterScope(t *testing.T) {
 	lw := rep.(repo.RepositoryWriter)
 
 	// w1, w2, w3 are indepdendent sessions.
-	w1, err := rep.NewWriter(ctx, repo.WriteSessionOptions{Purpose: "writer1"})
+	_, w1, err := rep.NewWriter(ctx, repo.WriteSessionOptions{Purpose: "writer1"})
 	require.NoError(t, err)
 
 	defer w1.Close(ctx)
 
-	w2, err := rep.NewWriter(ctx, repo.WriteSessionOptions{Purpose: "writer2"})
+	_, w2, err := rep.NewWriter(ctx, repo.WriteSessionOptions{Purpose: "writer2"})
 	require.NoError(t, err)
 
 	defer w2.Close(ctx)
 
-	w3, err := rep.NewWriter(ctx, repo.WriteSessionOptions{Purpose: "writer3"})
+	_, w3, err := rep.NewWriter(ctx, repo.WriteSessionOptions{Purpose: "writer3"})
 	require.NoError(t, err)
 
 	defer w3.Close(ctx)
@@ -403,7 +391,7 @@ func TestWriteSessionFlushOnSuccess(t *testing.T) {
 
 	var oid object.ID
 
-	require.NoError(t, repo.WriteSession(ctx, env.Repository, repo.WriteSessionOptions{}, func(w repo.RepositoryWriter) error {
+	require.NoError(t, repo.WriteSession(ctx, env.Repository, repo.WriteSessionOptions{}, func(ctx context.Context, w repo.RepositoryWriter) error {
 		oid = writeObject(ctx, t, w, []byte{1, 2, 3}, "test-1")
 		return nil
 	}))
@@ -417,7 +405,7 @@ func TestWriteSessionNoFlushOnFailure(t *testing.T) {
 	var oid object.ID
 
 	someErr := errors.New("some error")
-	err := repo.WriteSession(ctx, env.Repository, repo.WriteSessionOptions{}, func(w repo.RepositoryWriter) error {
+	err := repo.WriteSession(ctx, env.Repository, repo.WriteSessionOptions{}, func(ctx context.Context, w repo.RepositoryWriter) error {
 		oid = writeObject(ctx, t, w, []byte{1, 2, 3}, "test-1")
 		return someErr
 	})
@@ -437,7 +425,7 @@ func TestWriteSessionFlushOnFailure(t *testing.T) {
 	someErr := errors.New("some error")
 	err := repo.WriteSession(ctx, env.Repository, repo.WriteSessionOptions{
 		FlushOnFailure: true,
-	}, func(w repo.RepositoryWriter) error {
+	}, func(ctx context.Context, w repo.RepositoryWriter) error {
 		oid = writeObject(ctx, t, w, []byte{1, 2, 3}, "test-1")
 		return someErr
 	})

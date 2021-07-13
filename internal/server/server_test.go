@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
 	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
@@ -12,10 +11,12 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/pkg/errors"
 	"github.com/stretchr/testify/require"
 
 	"github.com/kopia/kopia/internal/apiclient"
 	"github.com/kopia/kopia/internal/auth"
+	"github.com/kopia/kopia/internal/passwordpersist"
 	"github.com/kopia/kopia/internal/repotesting"
 	"github.com/kopia/kopia/internal/server"
 	"github.com/kopia/kopia/internal/testlogging"
@@ -44,8 +45,9 @@ func startServer(ctx context.Context, t *testing.T) *repo.APIServerInfo {
 	_, env := repotesting.NewEnvironment(t)
 
 	s, err := server.New(ctx, server.Options{
-		ConfigFile: env.ConfigFile(),
-		Authorizer: auth.LegacyAuthorizer(),
+		ConfigFile:      env.ConfigFile(),
+		PasswordPersist: passwordpersist.File,
+		Authorizer:      auth.LegacyAuthorizer(),
 		Authenticator: auth.CombineAuthenticators(
 			auth.AuthenticateSingleUser(testUsername+"@"+testHostname, testPassword),
 			auth.AuthenticateSingleUser(testUIUsername, testUIPassword),
@@ -53,6 +55,8 @@ func startServer(ctx context.Context, t *testing.T) *repo.APIServerInfo {
 		RefreshInterval: 1 * time.Minute,
 		UIUser:          testUIUsername,
 	})
+
+	require.NoError(t, err)
 
 	s.SetRepository(ctx, env.Repository)
 
@@ -199,7 +203,7 @@ func remoteRepositoryTest(ctx context.Context, t *testing.T, rep repo.Repository
 		OnUpload: func(i int64) {
 			uploaded += i
 		},
-	}, func(w repo.RepositoryWriter) error {
+	}, func(ctx context.Context, w repo.RepositoryWriter) error {
 		mustGetObjectNotFound(ctx, t, w, "abcd")
 		mustGetManifestNotFound(ctx, t, w, "mnosuchmanifest")
 		mustManifestNotFound(t, w.DeleteManifest(ctx, manifestID2))
@@ -207,18 +211,22 @@ func remoteRepositoryTest(ctx context.Context, t *testing.T, rep repo.Repository
 
 		result = mustWriteObject(ctx, t, w, written)
 
+		require.NoError(t, w.Flush(ctx))
+
 		if uploaded == 0 {
-			t.Fatalf("did not report uploaded bytes")
+			return errors.Errorf("did not report uploaded bytes")
 		}
 
 		uploaded = 0
 		result2 := mustWriteObject(ctx, t, w, written)
+		require.NoError(t, w.Flush(ctx))
+
 		if uploaded != 0 {
-			t.Fatalf("unexpected upload when writing duplicate object")
+			return errors.Errorf("unexpected upload when writing duplicate object")
 		}
 
 		if result != result2 {
-			t.Fatalf("two identical object with different IDs: %v vs %v", result, result2)
+			return errors.Errorf("two identical object with different IDs: %v vs %v", result, result2)
 		}
 
 		// verify data is read back the same.
@@ -233,7 +241,7 @@ func remoteRepositoryTest(ctx context.Context, t *testing.T, rep repo.Repository
 
 		_, err = ow.Result()
 		if err == nil {
-			t.Fatalf("unexpected success writing object with 'm' prefix")
+			return errors.Errorf("unexpected success writing object with 'm' prefix")
 		}
 
 		manifestID, err = snapshot.SaveSnapshot(ctx, w, &snapshot.Manifest{

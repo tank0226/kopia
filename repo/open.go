@@ -47,8 +47,9 @@ var log = logging.GetContextLoggerFunc("kopia/repo")
 
 // Options provides configuration parameters for connection to a repository.
 type Options struct {
-	TraceStorage func(f string, args ...interface{}) // Logs all storage access using provided Printf-style function
-	TimeNowFunc  func() time.Time                    // Time provider
+	TraceStorage       func(f string, args ...interface{}) // Logs all storage access using provided Printf-style function
+	TimeNowFunc        func() time.Time                    // Time provider
+	DisableInternalLog bool                                // Disable internal log
 }
 
 // ErrInvalidPassword is returned when repository password is invalid.
@@ -95,6 +96,7 @@ func getContentCacheOrNil(ctx context.Context, opt *content.CachingOptions, pass
 	// derive content cache key from the password & HMAC secret using scrypt.
 	salt := append([]byte("content-cache-protection"), opt.HMACSecret...)
 
+	// nolint:gomnd
 	cacheEncryptionKey, err := scrypt.Key([]byte(password), salt, 65536, 8, 1, 32)
 	if err != nil {
 		return nil, errors.Wrap(err, "unable to derive cache encryption key from password")
@@ -105,7 +107,12 @@ func getContentCacheOrNil(ctx context.Context, opt *content.CachingOptions, pass
 		return nil, errors.Wrap(err, "unable to initialize protection")
 	}
 
-	return cache.NewPersistentCache(ctx, "cache-storage", cs, prot, opt.MaxCacheSizeBytes, cache.DefaultTouchThreshold, cache.DefaultSweepFrequency)
+	pc, err := cache.NewPersistentCache(ctx, "cache-storage", cs, prot, opt.MaxCacheSizeBytes, cache.DefaultTouchThreshold, cache.DefaultSweepFrequency)
+	if err != nil {
+		return nil, errors.Wrap(err, "unable to open persistent cache")
+	}
+
+	return pc, nil
 }
 
 // OpenAPIServer connects remote repository over Kopia API.
@@ -181,10 +188,10 @@ func openWithConfig(ctx context.Context, st blob.Storage, lc *LocalConfig, passw
 
 	repoConfig, err := f.decryptFormatBytes(masterKey)
 	if err != nil {
-		// nolint:wrapcheck
 		return nil, ErrInvalidPassword
 	}
 
+	// nolint:gomnd
 	caching.HMACSecret = deriveKeyFromMasterKey(masterKey, f.UniqueID, []byte("local-cache-integrity"), 16)
 
 	fo := &repoConfig.FormattingOptions
@@ -197,6 +204,7 @@ func openWithConfig(ctx context.Context, st blob.Storage, lc *LocalConfig, passw
 	cmOpts := &content.ManagerOptions{
 		RepositoryFormatBytes: fb,
 		TimeNow:               defaultTime(options.TimeNowFunc),
+		DisableInternalLog:    options.DisableInternalLog,
 	}
 
 	scm, err := content.NewSharedManager(ctx, st, fo, caching, cmOpts)
@@ -204,10 +212,10 @@ func openWithConfig(ctx context.Context, st blob.Storage, lc *LocalConfig, passw
 		return nil, errors.Wrap(err, "unable to create shared content manager")
 	}
 
-	cm := content.NewWriteManager(scm, content.SessionOptions{
+	cm := content.NewWriteManager(ctx, scm, content.SessionOptions{
 		SessionUser: lc.Username,
 		SessionHost: lc.Hostname,
-	})
+	}, "")
 
 	om, err := object.NewObjectManager(ctx, cm, repoConfig.Format)
 	if err != nil {
@@ -233,6 +241,7 @@ func openWithConfig(ctx context.Context, st blob.Storage, lc *LocalConfig, passw
 			timeNow:        cmOpts.TimeNow,
 			cliOpts:        lc.ClientOptions.ApplyDefaults(ctx, "Repository in "+st.DisplayName()),
 			configFile:     configFile,
+			nextWriterID:   new(int32),
 		},
 		closed: make(chan struct{}),
 	}
@@ -268,14 +277,14 @@ func writeCacheMarker(cacheDir string) error {
 		return errors.Wrap(err, "unable to write cachedir marker contents")
 	}
 
-	return f.Close()
+	return errors.Wrap(f.Close(), "error closing cache marker file")
 }
 
 func readAndCacheFormatBlobBytes(ctx context.Context, st blob.Storage, cacheDirectory string) ([]byte, error) {
 	cachedFile := filepath.Join(cacheDirectory, "kopia.repository")
 
 	if cacheDirectory != "" {
-		if err := os.MkdirAll(cacheDirectory, 0o700); err != nil && !os.IsExist(err) {
+		if err := os.MkdirAll(cacheDirectory, cache.DirMode); err != nil && !os.IsExist(err) {
 			log(ctx).Errorf("unable to create cache directory: %v", err)
 		}
 

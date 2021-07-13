@@ -1,6 +1,7 @@
 package snapshot
 
 import (
+	"context"
 	"encoding/json"
 	"sort"
 	"strconv"
@@ -28,6 +29,8 @@ type Manifest struct {
 	RootEntry *DirEntry `json:"rootEntry"`
 
 	RetentionReasons []string `json:"-"`
+
+	Tags map[string]string `json:"tags,omitempty"`
 }
 
 // EntryType is a type of a filesystem entry.
@@ -50,8 +53,10 @@ func (p Permissions) MarshalJSON() ([]byte, error) {
 		return nil, nil
 	}
 
+	// nolint:gomnd
 	s := "0" + strconv.FormatInt(int64(p), 8)
 
+	// nolint:wrapcheck
 	return json.Marshal(&s)
 }
 
@@ -63,6 +68,7 @@ func (p *Permissions) UnmarshalJSON(b []byte) error {
 		return errors.Wrap(err, "unable to unmarshal JSON")
 	}
 
+	// nolint:gomnd
 	v, err := strconv.ParseInt(s, 0, 32)
 	if err != nil {
 		return errors.Wrap(err, "unable to parse permission string")
@@ -89,6 +95,12 @@ type DirEntry struct {
 // HasDirEntry is implemented by objects that have a DirEntry associated with them.
 type HasDirEntry interface {
 	DirEntry() *DirEntry
+}
+
+// HasDirEntryOrNil is implemented by objects that may have a DirEntry
+// stored in the object's corresponding shallow placeholder file.
+type HasDirEntryOrNil interface {
+	DirEntryOrNil(ctx context.Context) (*DirEntry, error)
 }
 
 // DirManifest represents serialized contents of a directory.

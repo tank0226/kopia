@@ -75,6 +75,7 @@ func (s *s3Storage) GetBlob(ctx context.Context, b blob.ID, offset, length int64
 		return nil, translateError(err)
 	}
 
+	// nolint:wrapcheck
 	return blob.EnsureLengthExactly(fetched, length)
 }
 
@@ -201,6 +202,10 @@ func (s *s3Storage) String() string {
 
 func (s *s3Storage) DisplayName() string {
 	return fmt.Sprintf("S3: %v %v", s.Endpoint, s.BucketName)
+}
+
+func (s *s3Storage) FlushCaches(ctx context.Context) error {
+	return nil
 }
 
 func toBandwidth(bytesPerSecond int) iothrottler.Bandwidth {

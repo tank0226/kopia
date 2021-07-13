@@ -1,4 +1,4 @@
-COVERAGE_PACKAGES=github.com/kopia/kopia/repo/...,github.com/kopia/kopia/fs/...,github.com/kopia/kopia/snapshot/...
+COVERAGE_PACKAGES=./repo/...,./fs/...,./snapshot/...,./cli/...,./internal/...
 TEST_FLAGS?=
 
 KOPIA_INTEGRATION_EXE=$(CURDIR)/dist/testing_$(GOOS)_$(GOARCH)/kopia.exe
@@ -45,13 +45,17 @@ endif
 -include ./Makefile.local.mk
 
 install: html-ui
-	go install $(KOPIA_BUILD_FLAGS) -tags embedhtml
+	go install $(KOPIA_BUILD_FLAGS) -tags $(KOPIA_BUILD_TAGS)
+
+install-profiling: KOPIA_BUILD_TAGS=embedhtml,profiling
+install-profiling: html-ui
+	go install $(KOPIA_BUILD_FLAGS) -tags $(KOPIA_BUILD_TAGS)
 
 install-noui:
 	go install $(KOPIA_BUILD_FLAGS)
 
 install-race:
-	go install -race $(KOPIA_BUILD_FLAGS) -tags embedhtml
+	go install -race $(KOPIA_BUILD_FLAGS) -tags $(KOPIA_BUILD_TAGS)
 
 lint: $(linter)
 	$(linter) --deadline $(LINTER_DEADLINE) run $(linter_flags)
@@ -59,6 +63,10 @@ lint: $(linter)
 lint-and-log: $(linter)
 	$(linter) --deadline $(LINTER_DEADLINE) run $(linter_flags) | tee .linterr.txt
 
+lint-all: $(linter)
+	GOOS=windows $(linter) --deadline $(LINTER_DEADLINE) run $(linter_flags)
+	GOOS=linux $(linter) --deadline $(LINTER_DEADLINE) run $(linter_flags)
+	GOOS=darwin $(linter) --deadline $(LINTER_DEADLINE) run $(linter_flags)
 
 vet:
 	go vet -all .
@@ -102,8 +110,8 @@ htmlui/build/index.html: html-ui
 
 # on macOS build and sign AMD64, ARM64 and Universal binary and *.tar.gz files for them
 dist/kopia_darwin_universal/kopia dist/kopia_darwin_amd64/kopia dist/kopia_darwin_arm6/kopia: htmlui/build/index.html $(all_go_sources)
-	GOARCH=arm64 go build $(KOPIA_BUILD_FLAGS) -o dist/kopia_darwin_arm64/kopia -tags embedhtml
-	GOARCH=amd64 go build $(KOPIA_BUILD_FLAGS) -o dist/kopia_darwin_amd64/kopia -tags embedhtml
+	GOARCH=arm64 go build $(KOPIA_BUILD_FLAGS) -o dist/kopia_darwin_arm64/kopia -tags $(KOPIA_BUILD_TAGS)
+	GOARCH=amd64 go build $(KOPIA_BUILD_FLAGS) -o dist/kopia_darwin_amd64/kopia -tags $(KOPIA_BUILD_TAGS)
 	mkdir -p dist/kopia_darwin_universal
 	lipo -create -output dist/kopia_darwin_universal/kopia dist/kopia_darwin_arm64/kopia dist/kopia_darwin_amd64/kopia
 ifneq ($(MACOS_SIGNING_IDENTITY),)
@@ -117,7 +125,7 @@ endif
 
 # on Windows build and sign AMD64 and *.zip file
 dist/kopia_windows_amd64/kopia.exe: htmlui/build/index.html $(all_go_sources)
-	GOOS=windows GOARCH=amd64 go build $(KOPIA_BUILD_FLAGS) -o dist/kopia_windows_amd64/kopia.exe -tags embedhtml
+	GOOS=windows GOARCH=amd64 go build $(KOPIA_BUILD_FLAGS) -o dist/kopia_windows_amd64/kopia.exe -tags $(KOPIA_BUILD_TAGS)
 ifneq ($(WINDOWS_SIGN_TOOL),)
 	tools/.tools/signtool.exe sign //sha1 $(WINDOWS_CERT_SHA1) //fd sha256 //tr "http://timestamp.digicert.com" //v dist/kopia_windows_amd64/kopia.exe
 endif
@@ -132,7 +140,7 @@ dist/kopia_linux_amd64/kopia dist/kopia_linux_arm64/kopia dist/kopia_linux_arm_6
 ifeq ($(GOARCH),amd64)
 	$(MAKE) goreleaser
 else
-	go build $(KOPIA_BUILD_FLAGS) -o $(kopia_ui_embedded_exe) -tags embedhtml
+	go build $(KOPIA_BUILD_FLAGS) -o $(kopia_ui_embedded_exe) -tags $(KOPIA_BUILD_TAGS)
 endif
 
 # builds kopia CLI binary that will be later used as a server for kopia-ui.
@@ -147,13 +155,15 @@ ifeq ($(GOARCH),amd64)
 	$(retry) $(MAKE) kopia-ui
 endif
 
-ci-tests: lint vet test-with-coverage
+ci-tests: lint vet test
 
-ci-integration-tests: integration-tests robustness-tool-tests
-	$(MAKE) stress-test
+ci-integration-tests:
+	$(MAKE) integration-tests
+	$(MAKE) integration-tests-index-v2
+	$(MAKE) robustness-tool-tests
 
 ci-publish-coverage:
-ifeq ($(GOOS)/$(GOARCH)/$(IS_PULL_REQUEST),linux/amd64/false)
+ifeq ($(GOOS)/$(GOARCH),linux/amd64)
 	-bash -c "bash <(curl -s https://codecov.io/bash) -f coverage.txt"
 endif
 
@@ -186,17 +196,17 @@ dev-deps:
 	GO111MODULE=off go get -u github.com/sqs/goreturns
 
 test-with-coverage: $(gotestsum)
-	$(GO_TEST) $(UNIT_TEST_RACE_FLAGS) -count=$(REPEAT_TEST) -covermode=atomic -coverprofile=coverage.txt --coverpkg $(COVERAGE_PACKAGES) -timeout 300s ./...
+	$(GO_TEST) $(UNIT_TEST_RACE_FLAGS) -tags testing -count=$(REPEAT_TEST) -covermode=atomic -coverprofile=coverage.txt --coverpkg $(COVERAGE_PACKAGES) -timeout 300s ./...
 
 test: GOTESTSUM_FLAGS=--format=$(GOTESTSUM_FORMAT) --no-summary=skipped --jsonfile=.tmp.unit-tests.json
 test: $(gotestsum)
-	$(GO_TEST) $(UNIT_TEST_RACE_FLAGS) -count=$(REPEAT_TEST) -timeout $(UNIT_TESTS_TIMEOUT) ./...
+	$(GO_TEST) $(UNIT_TEST_RACE_FLAGS) -tags testing -count=$(REPEAT_TEST) -timeout $(UNIT_TESTS_TIMEOUT) ./...
 	-$(gotestsum) tool slowest --jsonfile .tmp.unit-tests.json  --threshold 1000ms
 
 provider-tests: export KOPIA_PROVIDER_TEST=true
 provider-tests: export RCLONE_EXE=$(rclone)
 provider-tests: GOTESTSUM_FLAGS=--format=$(GOTESTSUM_FORMAT) --no-summary=skipped --jsonfile=.tmp.provider-tests.json
-provider-tests: $(gotestsum) $(rclone)
+provider-tests: $(gotestsum) $(rclone) $(MINIO_MC_PATH)
 	$(GO_TEST) $(UNIT_TEST_RACE_FLAGS) -count=$(REPEAT_TEST) -timeout $(UNIT_TESTS_TIMEOUT) ./repo/blob/...
 	-$(gotestsum) tool slowest --jsonfile .tmp.provider-tests.json  --threshold 1000ms
 
@@ -216,6 +226,9 @@ integration-tests: build-integration-test-binary $(gotestsum) $(TESTING_ACTION_E
 	 $(GO_TEST) $(TEST_FLAGS) -count=$(REPEAT_TEST) -parallel $(PARALLEL) -timeout 3600s github.com/kopia/kopia/tests/end_to_end_test
 	 -$(gotestsum) tool slowest --jsonfile .tmp.integration-tests.json  --threshold 1000ms
 
+integration-tests-index-v2:
+	KOPIA_CREATE_INDEX_VERSION=2 KOPIA_RUN_ALL_INTEGRATION_TESTS=true $(MAKE) integration-tests
+
 endurance-tests: export KOPIA_EXE ?= $(KOPIA_INTEGRATION_EXE)
 endurance-tests: export KOPIA_LOGS_DIR=$(CURDIR)/.logs
 endurance-tests: build-integration-test-binary $(gotestsum)
@@ -227,6 +240,12 @@ robustness-tests: build-integration-test-binary $(gotestsum)
 	FIO_DOCKER_IMAGE=$(FIO_DOCKER_TAG) \
 	$(GO_TEST) -count=$(REPEAT_TEST) github.com/kopia/kopia/tests/robustness/robustness_test $(TEST_FLAGS)
 
+robustness-server-tests: export KOPIA_EXE ?= $(KOPIA_INTEGRATION_EXE)
+robustness-server-tests: GOTESTSUM_FORMAT=testname
+robustness-server-tests: build-integration-test-binary $(gotestsum)
+	FIO_DOCKER_IMAGE=$(FIO_DOCKER_TAG) \
+	$(GO_TEST) -count=$(REPEAT_TEST) github.com/kopia/kopia/tests/robustness/multiclient_test $(TEST_FLAGS)
+
 robustness-tool-tests: export KOPIA_EXE ?= $(KOPIA_INTEGRATION_EXE)
 robustness-tool-tests: export FIO_DOCKER_IMAGE=$(FIO_DOCKER_TAG)
 robustness-tool-tests: build-integration-test-binary $(gotestsum)
@@ -234,10 +253,13 @@ ifeq ($(GOOS)/$(GOARCH),linux/amd64)
 	$(GO_TEST) -count=$(REPEAT_TEST) github.com/kopia/kopia/tests/tools/... github.com/kopia/kopia/tests/robustness/engine/... $(TEST_FLAGS)
 endif
 
-stress_test: export KOPIA_LONG_STRESS_TEST=1
+stress-test: export KOPIA_STRESS_TEST=1
+stress-test: export KOPIA_DEBUG_MANIFEST_MANAGER=1
+stress-test: export KOPIA_LOGS_DIR=$(CURDIR)/.logs
+stress-test: export KOPIA_KEEP_LOGS=1
 stress-test: $(gotestsum)
-	$(GO_TEST) -count=$(REPEAT_TEST) -timeout 200s github.com/kopia/kopia/tests/stress_test
-	$(GO_TEST) -count=$(REPEAT_TEST) -timeout 200s github.com/kopia/kopia/tests/repository_stress_test
+	$(GO_TEST) -count=$(REPEAT_TEST) -timeout 3600s github.com/kopia/kopia/tests/stress_test
+	$(GO_TEST) -count=$(REPEAT_TEST) -timeout 3600s github.com/kopia/kopia/tests/repository_stress_test
 
 layering-test:
 ifneq ($(GOOS),windows)

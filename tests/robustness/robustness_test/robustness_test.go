@@ -8,12 +8,13 @@ import (
 	"strconv"
 	"testing"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/kopia/kopia/internal/clock"
 	"github.com/kopia/kopia/internal/testlogging"
 	"github.com/kopia/kopia/tests/robustness"
 	"github.com/kopia/kopia/tests/robustness/engine"
 	"github.com/kopia/kopia/tests/robustness/fiofilewriter"
-	"github.com/kopia/kopia/tests/testenv"
 )
 
 func TestManySmallFiles(t *testing.T) {
@@ -28,16 +29,16 @@ func TestManySmallFiles(t *testing.T) {
 		fiofilewriter.MinNumFilesPerWriteField: strconv.Itoa(numFiles),
 	}
 
-	ctx := testlogging.Context(t)
+	ctx := testlogging.ContextWithLevel(t, testlogging.LevelInfo)
 
 	_, err := eng.ExecAction(ctx, engine.WriteRandomFilesActionKey, fileWriteOpts)
-	testenv.AssertNoError(t, err)
+	require.NoError(t, err)
 
 	snapOut, err := eng.ExecAction(ctx, engine.SnapshotDirActionKey, nil)
-	testenv.AssertNoError(t, err)
+	require.NoError(t, err)
 
 	_, err = eng.ExecAction(ctx, engine.RestoreSnapshotActionKey, snapOut)
-	testenv.AssertNoError(t, err)
+	require.NoError(t, err)
 }
 
 func TestOneLargeFile(t *testing.T) {
@@ -52,16 +53,16 @@ func TestOneLargeFile(t *testing.T) {
 		fiofilewriter.MinNumFilesPerWriteField: strconv.Itoa(numFiles),
 	}
 
-	ctx := testlogging.Context(t)
+	ctx := testlogging.ContextWithLevel(t, testlogging.LevelInfo)
 
 	_, err := eng.ExecAction(ctx, engine.WriteRandomFilesActionKey, fileWriteOpts)
-	testenv.AssertNoError(t, err)
+	require.NoError(t, err)
 
 	snapOut, err := eng.ExecAction(ctx, engine.SnapshotDirActionKey, nil)
-	testenv.AssertNoError(t, err)
+	require.NoError(t, err)
 
 	_, err = eng.ExecAction(ctx, engine.RestoreSnapshotActionKey, snapOut)
-	testenv.AssertNoError(t, err)
+	require.NoError(t, err)
 }
 
 func TestManySmallFilesAcrossDirecoryTree(t *testing.T) {
@@ -80,16 +81,16 @@ func TestManySmallFilesAcrossDirecoryTree(t *testing.T) {
 		engine.ActionRepeaterField:             strconv.Itoa(actionRepeats),
 	}
 
-	ctx := testlogging.Context(t)
+	ctx := testlogging.ContextWithLevel(t, testlogging.LevelInfo)
 
 	_, err := eng.ExecAction(ctx, engine.WriteRandomFilesActionKey, fileWriteOpts)
-	testenv.AssertNoError(t, err)
+	require.NoError(t, err)
 
 	snapOut, err := eng.ExecAction(ctx, engine.SnapshotDirActionKey, nil)
-	testenv.AssertNoError(t, err)
+	require.NoError(t, err)
 
 	_, err = eng.ExecAction(ctx, engine.RestoreSnapshotActionKey, snapOut)
-	testenv.AssertNoError(t, err)
+	require.NoError(t, err)
 }
 
 func TestRandomizedSmall(t *testing.T) {
@@ -111,9 +112,8 @@ func TestRandomizedSmall(t *testing.T) {
 		},
 	}
 
+	ctx := testlogging.ContextWithLevel(t, testlogging.LevelInfo)
 	for clock.Since(st) <= *randomizedTestDur {
-		ctx := testlogging.Context(t)
-
 		err := eng.RandomAction(ctx, opts)
 		if errors.Is(err, robustness.ErrNoOp) {
 			t.Log("Random action resulted in no-op")
@@ -121,6 +121,6 @@ func TestRandomizedSmall(t *testing.T) {
 			err = nil
 		}
 
-		testenv.AssertNoError(t, err)
+		require.NoError(t, err)
 	}
 }

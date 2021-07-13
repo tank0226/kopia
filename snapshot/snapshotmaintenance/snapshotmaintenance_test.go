@@ -131,7 +131,7 @@ func TestMaintenanceReuseDirManifest(t *testing.T) {
 
 	info, err := r2.(repo.DirectRepository).ContentReader().ContentInfo(ctx, content.ID(s2.RootObjectID()))
 	require.NoError(t, err)
-	require.False(t, info.Deleted, "content must not be deleted")
+	require.False(t, info.GetDeleted(), "content must not be deleted")
 
 	_, err = r2.VerifyObject(ctx, s2.RootObjectID())
 	require.NoError(t, err)
@@ -145,7 +145,7 @@ func TestMaintenanceReuseDirManifest(t *testing.T) {
 
 	info, err = th.RepositoryWriter.ContentReader().ContentInfo(ctx, content.ID(s2.RootObjectID()))
 	require.NoError(t, err)
-	require.True(t, info.Deleted, "content must be deleted")
+	require.True(t, info.GetDeleted(), "content must be deleted")
 
 	_, err = th.RepositoryWriter.VerifyObject(ctx, s2.RootObjectID())
 	require.NoError(t, err)
@@ -159,7 +159,7 @@ func TestMaintenanceReuseDirManifest(t *testing.T) {
 	// Was the previous root undeleted
 	info, err = th.RepositoryWriter.ContentReader().ContentInfo(ctx, content.ID(s2.RootObjectID()))
 	require.NoError(t, err)
-	require.False(t, info.Deleted, "content must not be deleted")
+	require.False(t, info.GetDeleted(), "content must not be deleted")
 
 	_, err = th.RepositoryWriter.VerifyObject(ctx, s2.RootObjectID())
 	require.NoError(t, err)
@@ -203,7 +203,7 @@ func TestMaintenanceAutoLiveness(t *testing.T) {
 	dir.AddDir("d1", defaultPermissions)
 	dir.AddFile("d1/f2", []byte{1, 2, 3, 4}, defaultPermissions)
 
-	require.NoError(t, repo.WriteSession(ctx, env.Repository, repo.WriteSessionOptions{}, func(w repo.RepositoryWriter) error {
+	require.NoError(t, repo.WriteSession(ctx, env.Repository, repo.WriteSessionOptions{}, func(ctx context.Context, w repo.RepositoryWriter) error {
 		_, err := createSnapshot(testlogging.Context(t), w, dir, si, "")
 		if err != nil {
 			return errors.Wrap(err, "unable to create snapshot")
@@ -221,7 +221,7 @@ func TestMaintenanceAutoLiveness(t *testing.T) {
 		ft.Advance(30 * time.Minute)
 
 		t.Logf("running maintenance at %v", ft.NowFunc()())
-		require.NoError(t, repo.DirectWriteSession(ctx, env.RepositoryWriter, repo.WriteSessionOptions{}, func(dw repo.DirectRepositoryWriter) error {
+		require.NoError(t, repo.DirectWriteSession(ctx, env.RepositoryWriter, repo.WriteSessionOptions{}, func(ctx context.Context, dw repo.DirectRepositoryWriter) error {
 			return snapshotmaintenance.Run(context.Background(), dw, maintenance.ModeAuto, false, maintenance.SafetyFull)
 		}))
 
@@ -269,7 +269,7 @@ func (th *testHarness) openAnother(t *testing.T) repo.RepositoryWriter {
 		r.Close(ctx)
 	})
 
-	w, err := r.NewWriter(ctx, repo.WriteSessionOptions{Purpose: "test"})
+	_, w, err := r.NewWriter(ctx, repo.WriteSessionOptions{Purpose: "test"})
 	if err != nil {
 		t.Fatal(err)
 	}

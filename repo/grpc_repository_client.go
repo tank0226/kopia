@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 
@@ -22,6 +23,7 @@ import (
 	"github.com/kopia/kopia/internal/retry"
 	"github.com/kopia/kopia/internal/tlsutil"
 	"github.com/kopia/kopia/repo/blob"
+	"github.com/kopia/kopia/repo/compression"
 	"github.com/kopia/kopia/repo/content"
 	"github.com/kopia/kopia/repo/hashing"
 	"github.com/kopia/kopia/repo/manifest"
@@ -32,6 +34,16 @@ import (
 // Kopia repository server. This is bigger than the size of any possible content, which is
 // defined by supported splitters.
 const MaxGRPCMessageSize = 20 << 20
+
+const (
+	// number of asynchronous content writes per session.
+	grpcAsyncWritesPerSession = 4
+
+	// size of per-session cache of content IDs that were previously read
+	// helps avoid round trip to the server to write the same content since we know it already exists
+	// this greatly helps with performance of incremental snapshots.
+	numRecentReadsToCache = 1024
+)
 
 var errShouldRetry = errors.New("should retry")
 
@@ -55,12 +67,18 @@ type grpcRepositoryClient struct {
 	// how many times we tried to establish inner session
 	innerSessionAttemptCount int
 
-	h            hashing.HashFunc
-	objectFormat object.Format
-	cliOpts      ClientOptions
-	omgr         *object.Manager
+	asyncWritesSemaphore chan struct{}
+	asyncWritesWG        errgroup.Group
+
+	h                                hashing.HashFunc
+	objectFormat                     object.Format
+	serverSupportsContentCompression bool
+	cliOpts                          ClientOptions
+	omgr                             *object.Manager
 
 	contentCache *cache.PersistentCache
+
+	recent recentlyRead
 }
 
 type grpcInnerSession struct {
@@ -173,6 +191,7 @@ func (r *grpcRepositoryClient) ClientOptions() ClientOptions {
 }
 
 func (r *grpcRepositoryClient) OpenObject(ctx context.Context, id object.ID) (object.Reader, error) {
+	// nolint:wrapcheck
 	return object.Open(ctx, r, id)
 }
 
@@ -181,6 +200,7 @@ func (r *grpcRepositoryClient) NewObjectWriter(ctx context.Context, opt object.W
 }
 
 func (r *grpcRepositoryClient) VerifyObject(ctx context.Context, id object.ID) ([]content.ID, error) {
+	// nolint:wrapcheck
 	return object.VerifyObject(ctx, r, id)
 }
 
@@ -360,6 +380,10 @@ func (r *grpcRepositoryClient) Refresh(ctx context.Context) error {
 }
 
 func (r *grpcRepositoryClient) Flush(ctx context.Context) error {
+	if err := r.asyncWritesWG.Wait(); err != nil {
+		return errors.Wrap(err, "error waiting for async writes")
+	}
+
 	_, err := r.inSessionWithoutRetry(ctx, func(ctx context.Context, sess *grpcInnerSession) (interface{}, error) {
 		return false, sess.Flush(ctx)
 	})
@@ -385,13 +409,13 @@ func (r *grpcInnerSession) Flush(ctx context.Context) error {
 	return errNoSessionResponse()
 }
 
-func (r *grpcRepositoryClient) NewWriter(ctx context.Context, opt WriteSessionOptions) (RepositoryWriter, error) {
+func (r *grpcRepositoryClient) NewWriter(ctx context.Context, opt WriteSessionOptions) (context.Context, RepositoryWriter, error) {
 	w, err := newGRPCAPIRepositoryForConnection(ctx, r.conn, r.connRefCount, r.cliOpts, opt, r.contentCache, false)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	return w, nil
+	return ctx, w, nil
 }
 
 type sessionAttemptFunc func(ctx context.Context, sess *grpcInnerSession) (interface{}, error)
@@ -410,12 +434,13 @@ func (r *grpcRepositoryClient) maybeRetry(ctx context.Context, attempt sessionAt
 // If the grpcRepositoryClient set to automatically retry and the provided callback returns io.EOF,
 // the inner session will be killed and re-established as necessary.
 func (r *grpcRepositoryClient) retry(ctx context.Context, attempt sessionAttemptFunc) (interface{}, error) {
+	// nolint:wrapcheck
 	return retry.WithExponentialBackoff(ctx, "invoking GRPC API", func() (interface{}, error) {
 		v, err := r.inSessionWithoutRetry(ctx, attempt)
 		if errors.Is(err, io.EOF) {
 			r.killInnerSession()
 
-			return nil, errShouldRetry //nolint:wrapcheck
+			return nil, errShouldRetry
 		}
 
 		return v, err
@@ -438,7 +463,7 @@ func (r *grpcRepositoryClient) ContentInfo(ctx context.Context, contentID conten
 		return sess.contentInfo(ctx, contentID)
 	})
 	if err != nil {
-		return content.Info{}, err
+		return nil, err
 	}
 
 	return v.(content.Info), nil
@@ -454,8 +479,8 @@ func (r *grpcInnerSession) contentInfo(ctx context.Context, contentID content.ID
 	}) {
 		switch rr := resp.Response.(type) {
 		case *apipb.SessionResponse_GetContentInfo:
-			return content.Info{
-				ID:               content.ID(rr.GetContentInfo.GetInfo().GetId()),
+			return &content.InfoStruct{
+				ContentID:        content.ID(rr.GetContentInfo.GetInfo().GetId()),
 				PackedLength:     rr.GetContentInfo.GetInfo().GetPackedLength(),
 				TimestampSeconds: rr.GetContentInfo.GetInfo().GetTimestampSeconds(),
 				PackBlobID:       blob.ID(rr.GetContentInfo.GetInfo().GetPackBlobId()),
@@ -466,11 +491,11 @@ func (r *grpcInnerSession) contentInfo(ctx context.Context, contentID content.ID
 			}, nil
 
 		default:
-			return content.Info{}, unhandledSessionResponse(resp)
+			return nil, unhandledSessionResponse(resp)
 		}
 	}
 
-	return content.Info{}, errNoSessionResponse()
+	return nil, errNoSessionResponse()
 }
 
 func errorFromSessionResponse(rr *apipb.ErrorResponse) error {
@@ -497,7 +522,7 @@ func unhandledSessionResponse(resp *apipb.SessionResponse) error {
 }
 
 func (r *grpcRepositoryClient) GetContent(ctx context.Context, contentID content.ID) ([]byte, error) {
-	return r.contentCache.GetOrLoad(ctx, string(contentID), func() ([]byte, error) {
+	b, err := r.contentCache.GetOrLoad(ctx, string(contentID), func() ([]byte, error) {
 		v, err := r.maybeRetry(ctx, func(ctx context.Context, sess *grpcInnerSession) (interface{}, error) {
 			return sess.GetContent(ctx, contentID)
 		})
@@ -507,6 +532,13 @@ func (r *grpcRepositoryClient) GetContent(ctx context.Context, contentID content
 
 		return v.([]byte), nil
 	})
+
+	if err == nil && contentID.HasPrefix() {
+		r.recent.add(contentID)
+	}
+
+	// nolint:wrapcheck
+	return b, err
 }
 
 func (r *grpcInnerSession) GetContent(ctx context.Context, contentID content.ID) ([]byte, error) {
@@ -529,28 +561,24 @@ func (r *grpcInnerSession) GetContent(ctx context.Context, contentID content.ID)
 	return nil, errNoSessionResponse()
 }
 
-func (r *grpcRepositoryClient) WriteContent(ctx context.Context, data []byte, prefix content.ID) (content.ID, error) {
-	if err := content.ValidatePrefix(prefix); err != nil {
-		return "", errors.Wrap(err, "invalid prefix")
-	}
+func (r *grpcRepositoryClient) SupportsContentCompression() bool {
+	return r.serverSupportsContentCompression
+}
 
-	var hashOutput [128]byte
-
-	contentID := prefix + content.ID(hex.EncodeToString(r.h(hashOutput[:0], data)))
-
+func (r *grpcRepositoryClient) doWrite(ctx context.Context, contentID content.ID, data []byte, prefix content.ID, comp compression.HeaderID) error {
 	// avoid uploading the content body if it already exists.
 	if _, err := r.ContentInfo(ctx, contentID); err == nil {
 		// content already exists
-		return contentID, nil
+		return nil
 	}
 
 	r.opt.OnUpload(int64(len(data)))
 
 	v, err := r.inSessionWithoutRetry(ctx, func(ctx context.Context, sess *grpcInnerSession) (interface{}, error) {
-		return sess.WriteContent(ctx, data, prefix)
+		return sess.WriteContent(ctx, data, prefix, comp)
 	})
 	if err != nil {
-		return "", err
+		return err
 	}
 
 	if prefix != "" {
@@ -558,10 +586,50 @@ func (r *grpcRepositoryClient) WriteContent(ctx context.Context, data []byte, pr
 		r.contentCache.Put(ctx, string(contentID), data)
 	}
 
-	return v.(content.ID), nil
+	if v.(content.ID) != contentID {
+		return errors.Errorf("server returned different content ID: %v vs %v", v.(content.ID), contentID)
+	}
+
+	return nil
 }
 
-func (r *grpcInnerSession) WriteContent(ctx context.Context, data []byte, prefix content.ID) (content.ID, error) {
+func (r *grpcRepositoryClient) WriteContent(ctx context.Context, data []byte, prefix content.ID, comp compression.HeaderID) (content.ID, error) {
+	if err := content.ValidatePrefix(prefix); err != nil {
+		return "", errors.Wrap(err, "invalid prefix")
+	}
+
+	// we will be writing asynchronously and server will reject this write, fail early.
+	if prefix == manifest.ContentPrefix {
+		return "", errors.Errorf("writing manifest contents not allowed")
+	}
+
+	var hashOutput [128]byte
+
+	contentID := prefix + content.ID(hex.EncodeToString(r.h(hashOutput[:0], data)))
+
+	if r.recent.exists(contentID) {
+		return contentID, nil
+	}
+
+	// acquire semaphore
+	r.asyncWritesSemaphore <- struct{}{}
+
+	// clone so that caller can reuse the buffer
+	data = append([]byte(nil), data...)
+
+	r.asyncWritesWG.Go(func() error {
+		defer func() {
+			// release semaphore
+			<-r.asyncWritesSemaphore
+		}()
+
+		return r.doWrite(ctxutil.Detach(ctx), contentID, data, prefix, comp)
+	})
+
+	return contentID, nil
+}
+
+func (r *grpcInnerSession) WriteContent(ctx context.Context, data []byte, prefix content.ID, comp compression.HeaderID) (content.ID, error) {
 	if err := content.ValidatePrefix(prefix); err != nil {
 		return "", errors.Wrap(err, "invalid prefix")
 	}
@@ -569,8 +637,9 @@ func (r *grpcInnerSession) WriteContent(ctx context.Context, data []byte, prefix
 	for resp := range r.sendRequest(ctx, &apipb.SessionRequest{
 		Request: &apipb.SessionRequest_WriteContent{
 			WriteContent: &apipb.WriteContentRequest{
-				Data:   data,
-				Prefix: string(prefix),
+				Data:        data,
+				Prefix:      string(prefix),
+				Compression: uint32(comp),
 			},
 		},
 	}) {
@@ -723,6 +792,7 @@ func (r *grpcRepositoryClient) getOrEstablishInnerSession(ctx context.Context) (
 			return nil, errors.Wrap(err, "error establishing session")
 		}
 
+		// nolint:forcetypeassert
 		r.innerSession = v.(*grpcInnerSession)
 	}
 
@@ -746,13 +816,14 @@ func newGRPCAPIRepositoryForConnection(ctx context.Context, conn *grpc.ClientCon
 	}
 
 	rr := &grpcRepositoryClient{
-		connRefCount:       connRefCount,
-		conn:               conn,
-		cliOpts:            cliOpts,
-		transparentRetries: transparentRetries,
-		opt:                opt,
-		isReadOnly:         cliOpts.ReadOnly,
-		contentCache:       contentCache,
+		connRefCount:         connRefCount,
+		conn:                 conn,
+		cliOpts:              cliOpts,
+		transparentRetries:   transparentRetries,
+		opt:                  opt,
+		isReadOnly:           cliOpts.ReadOnly,
+		contentCache:         contentCache,
+		asyncWritesSemaphore: make(chan struct{}, grpcAsyncWritesPerSession),
 	}
 
 	v, err := rr.inSessionWithoutRetry(ctx, func(ctx context.Context, sess *grpcInnerSession) (interface{}, error) {
@@ -767,6 +838,8 @@ func newGRPCAPIRepositoryForConnection(ctx context.Context, conn *grpc.ClientCon
 		rr.objectFormat = object.Format{
 			Splitter: p.Splitter,
 		}
+
+		rr.serverSupportsContentCompression = p.SupportsContentCompression
 
 		rr.omgr, err = object.NewObjectManager(ctx, rr, rr.objectFormat)
 		if err != nil {

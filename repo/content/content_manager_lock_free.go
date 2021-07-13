@@ -1,6 +1,7 @@
 package content
 
 import (
+	"bytes"
 	"context"
 	"crypto/aes"
 	cryptorand "crypto/rand"
@@ -11,33 +12,67 @@ import (
 
 	"github.com/kopia/kopia/internal/gather"
 	"github.com/kopia/kopia/repo/blob"
+	"github.com/kopia/kopia/repo/compression"
 	"github.com/kopia/kopia/repo/encryption"
 	"github.com/kopia/kopia/repo/hashing"
 )
 
+// maxCompressionOverheadPerContent is the maximum amount of overhead any compressor
+// would need for non-compressible data of maximum size.
+// The consequences of getting this wrong are not fatal - just an unnecessary memory allocation.
+const maxCompressionOverheadPerContent = 16384
+
 const indexBlobCompactionWarningThreshold = 1000
 
-func (sm *SharedManager) maybeEncryptContentDataForPacking(output *gather.WriteBuffer, data []byte, contentID ID) error {
-	var hashOutput [maxHashSize]byte
+func (sm *SharedManager) maybeCompressAndEncryptDataForPacking(output *gather.WriteBuffer, data []byte, contentID ID, comp compression.HeaderID) (compression.HeaderID, error) {
+	var hashOutput [hashing.MaxHashSize]byte
 
 	iv, err := getPackedContentIV(hashOutput[:], contentID)
 	if err != nil {
-		return errors.Wrapf(err, "unable to get packed content IV for %q", contentID)
+		return NoCompression, errors.Wrapf(err, "unable to get packed content IV for %q", contentID)
 	}
 
-	b := sm.encryptionBufferPool.Allocate(len(data) + sm.encryptor.Overhead())
+	// nolint:nestif
+	if comp != NoCompression {
+		if sm.format.IndexVersion < v2IndexVersion {
+			return NoCompression, errors.Errorf("compression is not enabled for this repository.")
+		}
+
+		// allocate temporary buffer to hold the compressed bytes.
+		tmp := sm.encryptionBufferPool.Allocate(len(data) + maxCompressionOverheadPerContent)
+		defer tmp.Release()
+
+		c := compression.ByHeaderID[comp]
+		if c == nil {
+			return NoCompression, errors.Errorf("unsupported compressor %x", comp)
+		}
+
+		cbuf := bytes.NewBuffer(tmp.Data[:0])
+		if err = c.Compress(cbuf, data); err != nil {
+			return NoCompression, errors.Wrap(err, "compression error")
+		}
+
+		if cd := cbuf.Bytes(); len(cd) >= len(data) {
+			// data was not compressible enough.
+			comp = NoCompression
+		} else {
+			data = cd
+		}
+	}
+
+	b := sm.encryptionBufferPool.Allocate(len(data) + sm.crypter.Encryptor.Overhead())
 	defer b.Release()
 
-	cipherText, err := sm.encryptor.Encrypt(b.Data[:0], data, iv)
+	cipherText, err := sm.crypter.Encryptor.Encrypt(b.Data[:0], data, iv)
 	if err != nil {
-		return errors.Wrap(err, "unable to encrypt")
+		return NoCompression, errors.Wrap(err, "unable to encrypt")
 	}
 
 	sm.Stats.encrypted(len(data))
 
 	output.Append(cipherText)
 
-	return nil
+	return comp, nil
 }
 
 func writeRandomBytesToBuffer(b *gather.WriteBuffer, count int) error {
@@ -66,16 +101,16 @@ func ValidatePrefix(prefix ID) error {
 	return errors.Errorf("invalid prefix, must be a empty or single letter between 'g' and 'z'")
 }
 
-func (bm *WriteManager) getContentDataUnlocked(ctx context.Context, pp *pendingPackInfo, bi *Info) ([]byte, error) {
+func (bm *WriteManager) getContentDataUnlocked(ctx context.Context, pp *pendingPackInfo, bi Info) ([]byte, error) {
 	var payload []byte
 
-	if pp != nil && pp.packBlobID == bi.PackBlobID {
+	if pp != nil && pp.packBlobID == bi.GetPackBlobID() {
 		// we need to use a lock here in case somebody else writes to the pack at the same time.
-		payload = pp.currentPackData.AppendSectionTo(nil, int(bi.PackOffset), int(bi.PackedLength))
+		payload = pp.currentPackData.AppendSectionTo(nil, int(bi.GetPackOffset()), int(bi.GetPackedLength()))
 	} else {
 		var err error
 
-		payload, err = bm.getCacheForContentID(bi.ID).getContent(ctx, cacheKey(bi.ID), bi.PackBlobID, int64(bi.PackOffset), int64(bi.PackedLength))
+		payload, err = bm.getCacheForContentID(bi.GetContentID()).getContent(ctx, cacheKey(bi.GetContentID()), bi.GetPackBlobID(), int64(bi.GetPackOffset()), int64(bi.GetPackedLength()))
 		if err != nil {
 			return nil, errors.Wrap(err, "getCacheForContentID")
 		}
@@ -84,16 +119,16 @@ func (bm *WriteManager) getContentDataUnlocked(ctx context.Context, pp *pendingP
 	return bm.decryptContentAndVerify(payload, bi)
 }
 
-func (bm *WriteManager) preparePackDataContent(ctx context.Context, pp *pendingPackInfo) (packIndexBuilder, error) {
+func (bm *WriteManager) preparePackDataContent(pp *pendingPackInfo) (packIndexBuilder, error) {
 	packFileIndex := packIndexBuilder{}
 	haveContent := false
 
 	for _, info := range pp.currentPackItems {
-		if info.PackBlobID == pp.packBlobID {
+		if info.GetPackBlobID() == pp.packBlobID {
 			haveContent = true
 		}
 
-		formatLog(ctx).Debugf("add-to-pack %v %v p:%v %v d:%v", pp.packBlobID, info.ID, info.PackBlobID, info.PackedLength, info.Deleted)
+		bm.log.Debugf("add-to-pack %v %v p:%v %v d:%v", pp.packBlobID, info.GetContentID(), info.GetPackBlobID(), info.GetPackedLength(), info.GetDeleted())
 
 		packFileIndex.Add(info)
 	}
@@ -140,36 +175,35 @@ func (bm *WriteManager) writePackFileNotLocked(ctx context.Context, packFile blo
 	bm.Stats.wroteContent(data.Length())
 	bm.onUpload(int64(data.Length()))
 
-	return bm.st.PutBlob(ctx, packFile, data)
+	return errors.Wrap(bm.st.PutBlob(ctx, packFile, data), "error writing pack file")
 }
 
 func (sm *SharedManager) hashData(output, data []byte) []byte {
 	// Hash the content and compute encryption key.
-	contentID := sm.hasher(output, data)
+	contentID := sm.crypter.HashFunction(output, data)
 	sm.Stats.hashedContent(len(data))
 
 	return contentID
 }
 
-// CreateHashAndEncryptor returns new hashing and encrypting functions based on
-// the specified formatting options.
-func CreateHashAndEncryptor(f *FormattingOptions) (hashing.HashFunc, encryption.Encryptor, error) {
+// CreateCrypter returns a Crypter based on the specified formatting options.
+func CreateCrypter(f *FormattingOptions) (*Crypter, error) {
 	h, err := hashing.CreateHashFunc(f)
 	if err != nil {
-		return nil, nil, errors.Wrap(err, "unable to create hash")
+		return nil, errors.Wrap(err, "unable to create hash")
 	}
 
 	e, err := encryption.CreateEncryptor(f)
 	if err != nil {
-		return nil, nil, errors.Wrap(err, "unable to create encryptor")
+		return nil, errors.Wrap(err, "unable to create encryptor")
 	}
 
 	contentID := h(nil, nil)
 
 	_, err = e.Encrypt(nil, nil, contentID)
 	if err != nil {
-		return nil, nil, errors.Wrap(err, "invalid encryptor")
+		return nil, errors.Wrap(err, "invalid encryptor")
 	}
 
-	return h, e, nil
+	return &Crypter{h, e}, nil
 }

@@ -18,6 +18,8 @@ import (
 // Each blob ID will consist of {sessionID}.{suffix}.
 const BlobIDPrefixSession blob.ID = "s"
 
+const sessionIDLength = 8
+
 // SessionID represents identifier of a session.
 type SessionID string
 
@@ -43,7 +45,7 @@ func generateSessionID(now time.Time) (SessionID, error) {
 	// Given number of seconds per month, this allows >1000 sessions per
 	// second before significant probability of collision while keeping the
 	// session identifiers relatively short.
-	r := make([]byte, 8)
+	r := make([]byte, sessionIDLength)
 	if _, err := cryptorand.Read(r); err != nil {
 		return "", errors.Wrap(err, "unable to read crypto bytes")
 	}
@@ -105,7 +107,7 @@ func (bm *WriteManager) writeSessionMarkerLocked(ctx context.Context) error {
 		return errors.Wrap(err, "unable to serialize session marker payload")
 	}
 
-	sessionBlobID, encrypted, err := encryptFullBlob(bm.hasher, bm.encryptor, js, BlobIDPrefixSession, bm.currentSessionInfo.ID)
+	sessionBlobID, encrypted, err := bm.crypter.EncryptBLOB(js, BlobIDPrefixSession, bm.currentSessionInfo.ID)
 	if err != nil {
 		return errors.Wrap(err, "unable to encrypt session marker")
 	}
@@ -163,7 +165,7 @@ func (bm *WriteManager) ListActiveSessions(ctx context.Context) (map[SessionID]*
 			return nil, errors.Wrapf(err, "error loading session: %v", b.BlobID)
 		}
 
-		payload, err = decryptFullBlob(bm.hasher, bm.encryptor, payload, b.BlobID)
+		payload, err = bm.crypter.DecryptBLOB(payload, b.BlobID)
 		if err != nil {
 			return nil, errors.Wrapf(err, "error decrypting session: %v", b.BlobID)
 		}

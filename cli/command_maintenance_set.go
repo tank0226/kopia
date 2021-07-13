@@ -6,27 +6,86 @@ import (
 
 	"github.com/pkg/errors"
 
+	"github.com/kopia/kopia/internal/units"
 	"github.com/kopia/kopia/repo"
 	"github.com/kopia/kopia/repo/maintenance"
 )
 
-var (
-	maintenanceSetCommand = maintenanceCommands.Command("set", "Set maintenance parameters")
+type commandMaintenanceSet struct {
+	maintenanceSetOwner          string
+	maintenanceSetEnableQuick    []bool // optional boolean
+	maintenanceSetEnableFull     []bool // optional boolean
+	maintenanceSetQuickFrequency time.Duration
+	maintenanceSetFullFrequency  time.Duration
+	maintenanceSetPauseQuick     time.Duration
+	maintenanceSetPauseFull      time.Duration
 
-	maintenanceSetOwner = maintenanceSetCommand.Flag("owner", "Set maintenance owner user@hostname").String()
+	maxRetainedLogCount       int
+	maxRetainedLogAge         time.Duration
+	maxTotalRetainedLogSizeMB int64
+}
 
-	maintenanceSetEnableQuick = maintenanceSetCommand.Flag("enable-quick", "Enable or disable quick maintenance").BoolList()
-	maintenanceSetEnableFull  = maintenanceSetCommand.Flag("enable-full", "Enable or disable full maintenance").BoolList()
+func (c *commandMaintenanceSet) setup(svc appServices, parent commandParent) {
+	cmd := parent.Command("set", "Set maintenance parameters")
 
-	maintenanceSetQuickFrequency = maintenanceSetCommand.Flag("quick-interval", "Set quick maintenance interval").DurationList()
-	maintenanceSetFullFrequency  = maintenanceSetCommand.Flag("full-interval", "Set full maintenance interval").DurationList()
+	c.maintenanceSetQuickFrequency = -1
+	c.maintenanceSetFullFrequency = -1
+	c.maintenanceSetPauseQuick = -1
+	c.maintenanceSetPauseFull = -1
 
-	maintenanceSetPauseQuick = maintenanceSetCommand.Flag("pause-quick", "Pause quick maintenance for a specified duration").DurationList()
-	maintenanceSetPauseFull  = maintenanceSetCommand.Flag("pause-full", "Pause full maintenance for a specified duration").DurationList()
-)
+	c.maxRetainedLogCount = -1
+	c.maxRetainedLogAge = -1
+	c.maxTotalRetainedLogSizeMB = -1
 
-func setMaintenanceOwnerFromFlags(ctx context.Context, p *maintenance.Params, rep repo.DirectRepositoryWriter, changed *bool) {
-	if v := *maintenanceSetOwner; v != "" {
+	cmd.Flag("owner", "Set maintenance owner user@hostname").StringVar(&c.maintenanceSetOwner)
+
+	cmd.Flag("enable-quick", "Enable or disable quick maintenance").BoolListVar(&c.maintenanceSetEnableQuick)
+	cmd.Flag("enable-full", "Enable or disable full maintenance").BoolListVar(&c.maintenanceSetEnableFull)
+
+	cmd.Flag("quick-interval", "Set quick maintenance interval").DurationVar(&c.maintenanceSetQuickFrequency)
+	cmd.Flag("full-interval", "Set full maintenance interval").DurationVar(&c.maintenanceSetFullFrequency)
+
+	cmd.Flag("pause-quick", "Pause quick maintenance for a specified duration").DurationVar(&c.maintenanceSetPauseQuick)
+	cmd.Flag("pause-full", "Pause full maintenance for a specified duration").DurationVar(&c.maintenanceSetPauseFull)
+
+	cmd.Flag("max-retained-log-count", "Set maximum number of log sessions to retain").IntVar(&c.maxRetainedLogCount)
+	cmd.Flag("max-retained-log-age", "Set maximum age of log sessions to retain").DurationVar(&c.maxRetainedLogAge)
+	cmd.Flag("max-retained-log-size-mb", "Set maximum total size of log sessions").Int64Var(&c.maxTotalRetainedLogSizeMB)
+
+	cmd.Action(svc.directRepositoryWriteAction(c.run))
+}
+
+func (c *commandMaintenanceSet) setLogCleanupParametersFromFlags(ctx context.Context, p *maintenance.Params, changed *bool) {
+	if v := c.maxRetainedLogCount; v != -1 {
+		cl := p.LogRetention.OrDefault()
+		cl.MaxCount = v
+		p.LogRetention = cl
+		*changed = true
+
+		log(ctx).Infof("Setting max retained log count to %v.", cl.MaxCount)
+	}
+
+	if v := c.maxRetainedLogAge; v != -1 {
+		cl := p.LogRetention.OrDefault()
+		cl.MaxAge = v
+		p.LogRetention = cl
+		*changed = true
+
+		log(ctx).Infof("Setting max retained log age to %v.", cl.MaxAge)
+	}
+
+	if v := c.maxTotalRetainedLogSizeMB; v != -1 {
+		cl := p.LogRetention.OrDefault()
+		cl.MaxTotalSize = v << 20 // nolint:gomnd
+		p.LogRetention = cl
+		*changed = true
+
+		log(ctx).Infof("Setting total retained log size to %v.", units.BytesStringBase2(cl.MaxTotalSize))
+	}
+}
+
+func (c *commandMaintenanceSet) setMaintenanceOwnerFromFlags(ctx context.Context, p *maintenance.Params, rep repo.DirectRepositoryWriter, changed *bool) {
+	if v := c.maintenanceSetOwner; v != "" {
 		if v == "me" {
 			p.Owner = rep.ClientOptions().UsernameAtHost()
 		} else {
@@ -39,12 +98,12 @@ func setMaintenanceOwnerFromFlags(ctx context.Context, p *maintenance.Params, re
 	}
 }
 
-func setMaintenanceEnabledAndIntervalFromFlags(ctx context.Context, c *maintenance.CycleParams, cycleName string, enableFlag []bool, intervalFlag []time.Duration, changed *bool) {
+func (c *commandMaintenanceSet) setMaintenanceEnabledAndIntervalFromFlags(ctx context.Context, cp *maintenance.CycleParams, cycleName string, enableFlag []bool, interval time.Duration, changed *bool) {
 	// we use lists to distinguish between flag not set
 	// Zero elements == not set, more than zero - flag set, in which case we pick the last value
 	if len(enableFlag) > 0 {
 		lastVal := enableFlag[len(enableFlag)-1]
-		c.Enabled = lastVal
+		cp.Enabled = lastVal
 		*changed = true
 
 		if lastVal {
@@ -54,16 +113,15 @@ func setMaintenanceEnabledAndIntervalFromFlags(ctx context.Context, c *maintenan
 		}
 	}
 
-	if len(intervalFlag) > 0 {
-		lastVal := intervalFlag[len(intervalFlag)-1]
-		c.Interval = lastVal
+	if interval != -1 {
+		cp.Interval = interval
 		*changed = true
 
-		log(ctx).Infof("Interval for %v maintenance set to %v.", cycleName, lastVal)
+		log(ctx).Infof("Interval for %v maintenance set to %v.", cycleName, interval)
 	}
 }
 
-func runMaintenanceSetParams(ctx context.Context, rep repo.DirectRepositoryWriter) error {
+func (c *commandMaintenanceSet) run(ctx context.Context, rep repo.DirectRepositoryWriter) error {
 	p, err := maintenance.GetParams(ctx, rep)
 	if err != nil {
 		return errors.Wrap(err, "unable to get current parameters")
@@ -76,20 +134,19 @@ func runMaintenanceSetParams(ctx context.Context, rep repo.DirectRepositoryWrite
 
 	var changedParams, changedSchedule bool
 
-	setMaintenanceOwnerFromFlags(ctx, p, rep, &changedParams)
-	setMaintenanceEnabledAndIntervalFromFlags(ctx, &p.QuickCycle, "quick", *maintenanceSetEnableQuick, *maintenanceSetQuickFrequency, &changedParams)
-	setMaintenanceEnabledAndIntervalFromFlags(ctx, &p.FullCycle, "full", *maintenanceSetEnableFull, *maintenanceSetFullFrequency, &changedParams)
+	c.setMaintenanceOwnerFromFlags(ctx, p, rep, &changedParams)
+	c.setMaintenanceEnabledAndIntervalFromFlags(ctx, &p.QuickCycle, "quick", c.maintenanceSetEnableQuick, c.maintenanceSetQuickFrequency, &changedParams)
+	c.setMaintenanceEnabledAndIntervalFromFlags(ctx, &p.FullCycle, "full", c.maintenanceSetEnableFull, c.maintenanceSetFullFrequency, &changedParams)
+	c.setLogCleanupParametersFromFlags(ctx, p, &changedParams)
 
-	if v := *maintenanceSetPauseQuick; len(v) > 0 {
-		pauseDuration := v[len(v)-1]
+	if pauseDuration := c.maintenanceSetPauseQuick; pauseDuration != -1 {
 		s.NextQuickMaintenanceTime = rep.Time().Add(pauseDuration)
 		changedSchedule = true
 
 		log(ctx).Infof("Quick maintenance paused until %v", formatTimestamp(s.NextQuickMaintenanceTime))
 	}
 
-	if v := *maintenanceSetPauseFull; len(v) > 0 {
-		pauseDuration := v[len(v)-1]
+	if pauseDuration := c.maintenanceSetPauseFull; pauseDuration != -1 {
 		s.NextFullMaintenanceTime = rep.Time().Add(pauseDuration)
 		changedSchedule = true
 
@@ -113,8 +170,4 @@ func runMaintenanceSetParams(ctx context.Context, rep repo.DirectRepositoryWrite
 	}
 
 	return nil
-}
-
-func init() {
-	maintenanceSetCommand.Action(directRepositoryWriteAction(runMaintenanceSetParams))
 }

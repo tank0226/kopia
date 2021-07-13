@@ -11,7 +11,9 @@ import (
 	"github.com/pkg/errors"
 	"golang.org/x/exp/mmap"
 
+	"github.com/kopia/kopia/internal/cache"
 	"github.com/kopia/kopia/repo/blob"
+	"github.com/kopia/kopia/repo/logging"
 )
 
 const (
@@ -23,6 +25,7 @@ type diskCommittedContentIndexCache struct {
 	dirname              string
 	timeNow              func() time.Time
 	v1PerContentOverhead uint32
+	log                  logging.Logger
 }
 
 func (c *diskCommittedContentIndexCache) indexBlobPath(indexBlobID blob.ID) string {
@@ -32,7 +35,7 @@ func (c *diskCommittedContentIndexCache) indexBlobPath(indexBlobID blob.ID) stri
 func (c *diskCommittedContentIndexCache) openIndex(ctx context.Context, indexBlobID blob.ID) (packIndex, error) {
 	fullpath := c.indexBlobPath(indexBlobID)
 
-	f, err := mmapOpenWithRetry(ctx, fullpath)
+	f, err := c.mmapOpenWithRetry(fullpath)
 	if err != nil {
 		return nil, err
 	}
@@ -42,7 +45,7 @@ func (c *diskCommittedContentIndexCache) openIndex(ctx context.Context, indexBlo
 
 // mmapOpenWithRetry attempts mmap.Open() with exponential back-off to work around rare issue specific to Windows where
 // we can't open the file right after it has been written.
-func mmapOpenWithRetry(ctx context.Context, path string) (*mmap.ReaderAt, error) {
+func (c *diskCommittedContentIndexCache) mmapOpenWithRetry(path string) (*mmap.ReaderAt, error) {
 	const (
 		maxRetries    = 8
 		startingDelay = 10 * time.Millisecond
@@ -55,7 +58,7 @@ func mmapOpenWithRetry(ctx context.Context, path string) (*mmap.ReaderAt, error)
 	retryCount := 0
 	for err != nil && retryCount < maxRetries {
 		retryCount++
-		log(ctx).Debugf("retry #%v unable to mmap.Open(): %v", retryCount, err)
+		c.log.Debugf("retry #%v unable to mmap.Open(): %v", retryCount, err)
 		time.Sleep(nextDelay)
 		nextDelay *= 2
 		f, err = mmap.Open(path)
@@ -113,7 +116,7 @@ func writeTempFileAtomic(dirname string, data []byte) (string, error) {
 	tf, err := ioutil.TempFile(dirname, "tmp")
 	if err != nil {
 		if os.IsNotExist(err) {
-			os.MkdirAll(dirname, 0o700) //nolint:errcheck
+			os.MkdirAll(dirname, cache.DirMode) //nolint:errcheck
 			tf, err = ioutil.TempFile(dirname, "tmp")
 		}
 	}
@@ -134,6 +137,8 @@ func writeTempFileAtomic(dirname string, data []byte) (string, error) {
 }
 
 func (c *diskCommittedContentIndexCache) expireUnused(ctx context.Context, used []blob.ID) error {
+	c.log.Debugf("expireUnused (except %v)", used)
+
 	entries, err := ioutil.ReadDir(c.dirname)
 	if err != nil {
 		return errors.Wrap(err, "can't list cache")
@@ -154,13 +159,13 @@ func (c *diskCommittedContentIndexCache) expireUnused(ctx context.Context, used 
 
 	for _, rem := range remaining {
 		if c.timeNow().Sub(rem.ModTime()) > unusedCommittedContentIndexCleanupTime {
-			log(ctx).Debugf("removing unused %v %v", rem.Name(), rem.ModTime())
+			c.log.Debugf("removing unused %v %v", rem.Name(), rem.ModTime())
 
 			if err := os.Remove(filepath.Join(c.dirname, rem.Name())); err != nil {
-				log(ctx).Errorf("unable to remove unused index file: %v", err)
+				c.log.Errorf("unable to remove unused index file: %v", err)
 			}
 		} else {
-			log(ctx).Debugf("keeping unused %v because it's too new %v", rem.Name(), rem.ModTime())
+			c.log.Debugf("keeping unused %v because it's too new %v", rem.Name(), rem.ModTime())
 		}
 	}
 

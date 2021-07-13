@@ -107,13 +107,21 @@ func (s *FaultyStorage) DisplayName() string {
 	return s.Base.DisplayName()
 }
 
+// FlushCaches implements blob.Storage.
+func (s *FaultyStorage) FlushCaches(ctx context.Context) error {
+	if err := s.getNextFault(ctx, "FlushCaches"); err != nil {
+		return err
+	}
+
+	return s.Base.FlushCaches(ctx)
+}
+
 func (s *FaultyStorage) getNextFault(ctx context.Context, method string, args ...interface{}) error {
 	s.mu.Lock()
 
 	faults := s.Faults[method]
 	if len(faults) == 0 {
 		s.mu.Unlock()
-		log(ctx).Debugf("no faults for %v %v", method, args)
 
 		return nil
 	}

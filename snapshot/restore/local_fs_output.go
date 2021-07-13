@@ -14,11 +14,14 @@ import (
 	"github.com/kopia/kopia/fs"
 	"github.com/kopia/kopia/fs/localfs"
 	"github.com/kopia/kopia/internal/atomicfile"
+	"github.com/kopia/kopia/snapshot"
 )
 
-const modBits = os.ModePerm | os.ModeSetgid | os.ModeSetuid | os.ModeSticky
-
-const maxTimeDeltaToConsiderFileTheSame = 2 * time.Second
+const (
+	modBits                           = os.ModePerm | os.ModeSetgid | os.ModeSetuid | os.ModeSticky
+	outputDirMode                     = 0o700 // default mode to create directories in before setting their ACLs
+	maxTimeDeltaToConsiderFileTheSame = 2 * time.Second
+)
 
 // FilesystemOutput contains the options for outputting a file system tree.
 type FilesystemOutput struct {
@@ -70,10 +73,15 @@ func (o *FilesystemOutput) BeginDirectory(ctx context.Context, relativePath stri
 // FinishDirectory implements restore.Output interface.
 func (o *FilesystemOutput) FinishDirectory(ctx context.Context, relativePath string, e fs.Directory) error {
 	path := filepath.Join(o.TargetPath, filepath.FromSlash(relativePath))
-	if err := o.setAttributes(path, e); err != nil {
+	if err := o.setAttributes(path, e, os.FileMode(0)); err != nil {
 		return errors.Wrap(err, "error setting attributes")
 	}
 
+	return SafeRemoveAll(path)
+}
+
+// WriteDirEntry implements restore.Output interface.
+func (o *FilesystemOutput) WriteDirEntry(ctx context.Context, relativePath string, de *snapshot.DirEntry, e fs.Directory) error {
 	return nil
 }
 
@@ -84,18 +92,18 @@ func (o *FilesystemOutput) Close(ctx context.Context) error {
 
 // WriteFile implements restore.Output interface.
 func (o *FilesystemOutput) WriteFile(ctx context.Context, relativePath string, f fs.File) error {
-	log(ctx).Debugf("WriteFile %v (%v bytes) %v", filepath.Join(o.TargetPath, relativePath), f.Size(), f.Mode())
+	log(ctx).Debugf("WriteFile %v (%v bytes) %v, %v", filepath.Join(o.TargetPath, relativePath), f.Size(), f.Mode(), f.ModTime())
 	path := filepath.Join(o.TargetPath, filepath.FromSlash(relativePath))
 
 	if err := o.copyFileContent(ctx, path, f); err != nil {
-		return errors.Wrap(err, "error creating directory")
+		return errors.Wrap(err, "error creating file")
 	}
 
-	if err := o.setAttributes(path, f); err != nil {
+	if err := o.setAttributes(path, f, os.FileMode(0)); err != nil {
 		return errors.Wrap(err, "error setting attributes")
 	}
 
-	return nil
+	return SafeRemoveAll(path)
 }
 
 // FileExists implements restore.Output interface.
@@ -130,7 +138,7 @@ func (o *FilesystemOutput) CreateSymlink(ctx context.Context, relativePath strin
 		return errors.Wrap(err, "error reading link target")
 	}
 
-	log(ctx).Debugf("CreateSymlink %v => %v", filepath.Join(o.TargetPath, relativePath), targetPath)
+	log(ctx).Debugf("CreateSymlink %v => %v, time %v", filepath.Join(o.TargetPath, relativePath), targetPath, e.ModTime())
 
 	path := filepath.Join(o.TargetPath, filepath.FromSlash(relativePath))
 
@@ -156,7 +164,7 @@ func (o *FilesystemOutput) CreateSymlink(ctx context.Context, relativePath strin
 		return errors.Wrap(err, "error creating symlink")
 	}
 
-	if err := o.setAttributes(path, e); err != nil {
+	if err := o.setAttributes(path, e, os.FileMode(0)); err != nil {
 		return errors.Wrap(err, "error setting attributes")
 	}
 
@@ -177,8 +185,10 @@ func (o *FilesystemOutput) SymlinkExists(ctx context.Context, relativePath strin
 	return (st.Mode() & os.ModeType) == os.ModeSymlink
 }
 
-// set permission, modification time and user/group ids on targetPath.
-func (o *FilesystemOutput) setAttributes(targetPath string, e fs.Entry) error {
+// setAttributes sets permission, modification time and user/group ids
+// on targetPath. modclear will clear the specified FileMod bits. Pass 0
+// to not clear any.
+func (o *FilesystemOutput) setAttributes(targetPath string, e fs.Entry, modclear os.FileMode) error {
 	le, err := localfs.NewEntry(targetPath)
 	if err != nil {
 		return errors.Wrap(err, "could not create local FS entry for "+targetPath)
@@ -194,6 +204,7 @@ func (o *FilesystemOutput) setAttributes(targetPath string, e fs.Entry) error {
 	// os.* functions change the target of the symlink and not the symlink itself.
 	if isSymlink(e) {
 		osChmod, osChown, osChtimes = symlinkChmod, symlinkChown, symlinkChtimes
+		modclear = os.FileMode(0)
 	}
 
 	// Set owner user and group from e
@@ -206,8 +217,8 @@ func (o *FilesystemOutput) setAttributes(targetPath string, e fs.Entry) error {
 	}
 
 	// Set file permissions from e
-	if o.shouldUpdatePermissions(le, e) {
-		if err = o.maybeIgnorePermissionError(osChmod(targetPath, e.Mode()&modBits)); err != nil {
+	if o.shouldUpdatePermissions(le, e, modclear) {
+		if err = o.maybeIgnorePermissionError(osChmod(targetPath, (e.Mode()&modBits)&^modclear)); err != nil {
 			return errors.Wrap(err, "could not change permissions on "+targetPath)
 		}
 	}
@@ -246,12 +257,12 @@ func (o *FilesystemOutput) shouldUpdateOwner(local, remote fs.Entry) bool {
 	return local.Owner() != remote.Owner()
 }
 
-func (o *FilesystemOutput) shouldUpdatePermissions(local, remote fs.Entry) bool {
+func (o *FilesystemOutput) shouldUpdatePermissions(local, remote fs.Entry, modclear os.FileMode) bool {
 	if o.SkipPermissions {
 		return false
 	}
 
-	return (local.Mode() & modBits) != (remote.Mode() & modBits)
+	return ((local.Mode() & modBits) &^ modclear) != (remote.Mode() & modBits)
 }
 
 func (o *FilesystemOutput) shouldUpdateTimes(local, remote fs.Entry) bool {
@@ -269,7 +280,8 @@ func isWindows() bool {
 func (o *FilesystemOutput) createDirectory(ctx context.Context, path string) error {
 	switch stat, err := os.Stat(path); {
 	case os.IsNotExist(err):
-		return os.MkdirAll(path, 0o700)
+		// nolint:wrapcheck
+		return os.MkdirAll(path, outputDirMode)
 	case err != nil:
 		return errors.Wrap(err, "failed to stat path "+path)
 	case stat.Mode().IsDir():
@@ -308,6 +320,7 @@ func (o *FilesystemOutput) copyFileContent(ctx context.Context, targetPath strin
 
 	log(ctx).Debugf("copying file contents to: %v", targetPath)
 
+	// nolint:wrapcheck
 	return atomicfile.Write(targetPath, r)
 }
 
@@ -325,3 +338,5 @@ func isEmptyDirectory(name string) (bool, error) {
 
 	return false, errors.Wrap(err, "error reading directory") // Either not empty or error
 }
+
+var _ Output = (*FilesystemOutput)(nil)

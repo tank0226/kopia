@@ -1,27 +1,21 @@
 package content
 
 import (
-	"bufio"
+	"bytes"
 	"crypto/rand"
-	"encoding/binary"
+	"hash/fnv"
 	"io"
+	"runtime"
 	"sort"
+	"sync"
 
 	"github.com/pkg/errors"
-
-	"github.com/kopia/kopia/repo/blob"
 )
 
-const (
-	packHeaderSize = 8
-	deletedMarker  = 0x80000000
-
-	entryFixedHeaderLength = 20
-	randomSuffixSize       = 32
-)
+const randomSuffixSize = 32 // number of random bytes to append at the end to make the index blob unique
 
 // packIndexBuilder prepares and writes content index.
-type packIndexBuilder map[ID]*Info
+type packIndexBuilder map[ID]Info
 
 // clone returns a deep clone of packIndexBuilder.
 func (b packIndexBuilder) clone() packIndexBuilder {
@@ -32,8 +26,7 @@ func (b packIndexBuilder) clone() packIndexBuilder {
 	r := packIndexBuilder{}
 
 	for k, v := range b {
-		i2 := *v
-		r[k] = &i2
+		r[k] = v
 	}
 
 	return r
@@ -41,155 +34,168 @@ func (b packIndexBuilder) clone() packIndexBuilder {
 
 // Add adds a new entry to the builder or conditionally replaces it if the timestamp is greater.
 func (b packIndexBuilder) Add(i Info) {
-	old, ok := b[i.ID]
-	if !ok || i.TimestampSeconds >= old.TimestampSeconds {
-		b[i.ID] = &i
+	cid := i.GetContentID()
+
+	if old, ok := b[cid]; !ok || i.GetTimestampSeconds() >= old.GetTimestampSeconds() {
+		b[cid] = i
 	}
 }
 
-func (b packIndexBuilder) sortedContents() []*Info {
-	var allContents []*Info
+// base36Value stores a base-36 reverse lookup such that ASCII character corresponds to its
+// base-36 value ('0'=0..'9'=9, 'a'=10, 'b'=11, .., 'z'=35).
+var base36Value [256]byte
 
-	for _, v := range b {
-		allContents = append(allContents, v)
+func init() {
+	for i := 0; i < 10; i++ {
+		base36Value['0'+i] = byte(i)
 	}
 
-	sort.Slice(allContents, func(i, j int) bool {
-		return allContents[i].ID < allContents[j].ID
-	})
-
-	return allContents
+	for i := 0; i < 26; i++ {
+		base36Value['a'+i] = byte(i + 10) //nolint:gomnd
+		base36Value['A'+i] = byte(i + 10) //nolint:gomnd
+	}
 }
 
-type indexLayout struct {
-	packBlobIDOffsets map[blob.ID]uint32
-	entryCount        int
-	keyLength         int
-	entryLength       int
-	extraDataOffset   uint32
+// sortedContents returns the list of []Info sorted lexicographically using bucket sort
+// sorting is optimized based on the format of content IDs (optional single-character
+// alphanumeric prefix (0-9a-z), followed by hexadecimal digits (0-9a-f).
+func (b packIndexBuilder) sortedContents() []Info {
+	var buckets [36 * 16][]Info
+
+	// phase 1 - bucketize into 576 (36 *16) separate lists
+	// by first [0-9a-z] and second character [0-9a-f].
+	for cid, v := range b {
+		first := int(base36Value[cid[0]])
+		second := int(base36Value[cid[1]])
+
+		buck := first<<4 + second //nolint:gomnd
+
+		buckets[buck] = append(buckets[buck], v)
+	}
+
+	// phase 2 - sort each non-empty bucket in parallel using goroutines
+	// this is much faster than sorting one giant list.
+	var wg sync.WaitGroup
+
+	numWorkers := runtime.NumCPU()
+	for worker := 0; worker < numWorkers; worker++ {
+		worker := worker
+
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			for i := range buckets {
+				if i%numWorkers == worker {
+					buck := buckets[i]
+
+					sort.Slice(buck, func(i, j int) bool {
+						return buck[i].GetContentID() < buck[j].GetContentID()
+					})
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	// Phase 3 - merge results from all buckets.
+	result := make([]Info, 0, len(b))
+
+	for i := 0; i < len(buckets); i++ {
+		result = append(result, buckets[i]...)
+	}
+
+	return result
 }
 
 // Build writes the pack index to the provided output.
-func (b packIndexBuilder) Build(output io.Writer) error {
-	allContents := b.sortedContents()
-	layout := &indexLayout{
-		packBlobIDOffsets: map[blob.ID]uint32{},
-		keyLength:         -1,
-		entryLength:       entryFixedHeaderLength,
-		entryCount:        len(allContents),
-	}
-
-	w := bufio.NewWriter(output)
-
-	// prepare extra data to be appended at the end of an index.
-	extraData := prepareExtraData(allContents, layout)
-
-	// write header
-	header := make([]byte, packHeaderSize)
-	header[0] = 1 // version
-	header[1] = byte(layout.keyLength)
-	binary.BigEndian.PutUint16(header[2:4], uint16(layout.entryLength))
-	binary.BigEndian.PutUint32(header[4:8], uint32(layout.entryCount))
-
-	if _, err := w.Write(header); err != nil {
-		return errors.Wrap(err, "unable to write header")
-	}
-
-	// write all sorted contents.
-	entry := make([]byte, layout.entryLength)
-
-	for _, it := range allContents {
-		if err := writeEntry(w, it, layout, entry); err != nil {
-			return errors.Wrap(err, "unable to write entry")
-		}
-	}
-
-	if _, err := w.Write(extraData); err != nil {
-		return errors.Wrap(err, "error writing extra data")
+func (b packIndexBuilder) Build(output io.Writer, version int) error {
+	if err := b.BuildStable(output, version); err != nil {
+		return err
 	}
 
 	randomSuffix := make([]byte, randomSuffixSize)
+
 	if _, err := rand.Read(randomSuffix); err != nil {
 		return errors.Wrap(err, "error getting random bytes for suffix")
 	}
 
-	if _, err := w.Write(randomSuffix); err != nil {
+	if _, err := output.Write(randomSuffix); err != nil {
 		return errors.Wrap(err, "error writing extra random suffix to ensure indexes are always globally unique")
 	}
 
-	return w.Flush()
+	return nil
 }
 
-func prepareExtraData(allContents []*Info, layout *indexLayout) []byte {
-	var extraData []byte
+// BuildStable writes the pack index to the provided output.
+func (b packIndexBuilder) BuildStable(output io.Writer, version int) error {
+	switch version {
+	case v1IndexVersion:
+		return b.buildV1(output)
 
-	var hashBuf [maxContentIDSize]byte
+	case v2IndexVersion:
+		return b.buildV2(output)
 
-	for i, it := range allContents {
-		if i == 0 {
-			layout.keyLength = len(contentIDToBytes(hashBuf[:0], it.ID))
+	default:
+		return errors.Errorf("unsupported index version: %v", version)
+	}
+}
+
+func (b packIndexBuilder) shard(maxShardSize int) []packIndexBuilder {
+	numShards := (len(b) + maxShardSize - 1) / maxShardSize
+	if numShards <= 1 {
+		return []packIndexBuilder{b}
+	}
+
+	result := make([]packIndexBuilder, numShards)
+	for i := range result {
+		result[i] = make(packIndexBuilder)
+	}
+
+	for k, v := range b {
+		h := fnv.New32a()
+		io.WriteString(h, string(k)) // nolint:errcheck
+
+		shard := h.Sum32() % uint32(numShards)
+
+		result[shard][k] = v
+	}
+
+	return result
+}
+
+func (b packIndexBuilder) buildShards(indexVersion int, stable bool, shardSize int) ([][]byte, error) {
+	if shardSize == 0 {
+		return nil, errors.Errorf("invalid shard size")
+	}
+
+	var (
+		shardedBuilders = b.shard(shardSize)
+		dataShards      [][]byte
+		randomSuffix    [32]byte
+	)
+
+	for _, s := range shardedBuilders {
+		var buf bytes.Buffer
+
+		if err := s.BuildStable(&buf, indexVersion); err != nil {
+			return nil, errors.Wrap(err, "error building index shard")
 		}
 
-		if it.PackBlobID != "" {
-			if _, ok := layout.packBlobIDOffsets[it.PackBlobID]; !ok {
-				layout.packBlobIDOffsets[it.PackBlobID] = uint32(len(extraData))
-				extraData = append(extraData, []byte(it.PackBlobID)...)
+		if !stable {
+			if _, err := rand.Read(randomSuffix[:]); err != nil {
+				return nil, errors.Wrap(err, "error getting random bytes for suffix")
+			}
+
+			if _, err := buf.Write(randomSuffix[:]); err != nil {
+				return nil, errors.Wrap(err, "error writing extra random suffix to ensure indexes are always globally unique")
 			}
 		}
+
+		dataShards = append(dataShards, buf.Bytes())
 	}
 
-	layout.extraDataOffset = uint32(packHeaderSize + layout.entryCount*(layout.keyLength+layout.entryLength))
-
-	return extraData
-}
-
-func writeEntry(w io.Writer, it *Info, layout *indexLayout, entry []byte) error {
-	var hashBuf [maxContentIDSize]byte
-
-	k := contentIDToBytes(hashBuf[:0], it.ID)
-
-	if len(k) != layout.keyLength {
-		return errors.Errorf("inconsistent key length: %v vs %v", len(k), layout.keyLength)
-	}
-
-	if err := formatEntry(entry, it, layout); err != nil {
-		return errors.Wrap(err, "unable to format entry")
-	}
-
-	if _, err := w.Write(k); err != nil {
-		return errors.Wrap(err, "error writing entry key")
-	}
-
-	if _, err := w.Write(entry); err != nil {
-		return errors.Wrap(err, "error writing entry")
-	}
-
-	return nil
-}
-
-func formatEntry(entry []byte, it *Info, layout *indexLayout) error {
-	entryTimestampAndFlags := entry[0:8]
-	entryPackFileOffset := entry[8:12]
-	entryPackedOffset := entry[12:16]
-	entryPackedLength := entry[16:20]
-	timestampAndFlags := uint64(it.TimestampSeconds) << 16 // nolint:gomnd
-
-	if len(it.PackBlobID) == 0 {
-		return errors.Errorf("empty pack content ID for %v", it.ID)
-	}
-
-	binary.BigEndian.PutUint32(entryPackFileOffset, layout.extraDataOffset+layout.packBlobIDOffsets[it.PackBlobID])
-
-	if it.Deleted {
-		binary.BigEndian.PutUint32(entryPackedOffset, it.PackOffset|deletedMarker)
-	} else {
-		binary.BigEndian.PutUint32(entryPackedOffset, it.PackOffset)
-	}
-
-	binary.BigEndian.PutUint32(entryPackedLength, it.PackedLength)
-	timestampAndFlags |= uint64(it.FormatVersion) << 8 // nolint:gomnd
-	timestampAndFlags |= uint64(len(it.PackBlobID))
-	binary.BigEndian.PutUint64(entryTimestampAndFlags, timestampAndFlags)
-
-	return nil
+	return dataShards, nil
 }

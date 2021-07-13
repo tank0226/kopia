@@ -17,6 +17,7 @@ import (
 
 	"github.com/kopia/kopia/internal/auth"
 	"github.com/kopia/kopia/internal/clock"
+	"github.com/kopia/kopia/internal/passwordpersist"
 	"github.com/kopia/kopia/internal/serverapi"
 	"github.com/kopia/kopia/internal/uitask"
 	"github.com/kopia/kopia/repo"
@@ -193,6 +194,7 @@ func (s *Server) isAuthCookieValid(username, cookieValue string) bool {
 }
 
 func (s *Server) generateShortTermAuthCookie(username string, now time.Time) (string, error) {
+	// nolint:wrapcheck
 	return jwt.NewWithClaims(jwt.SigningMethodHS256, &jwt.StandardClaims{
 		Subject:   username,
 		NotBefore: now.Add(-time.Minute).Unix(),
@@ -488,6 +490,12 @@ func (s *Server) periodicMaintenance(ctx context.Context, rep repo.Repository) {
 			return
 
 		case <-time.After(maintenanceAttemptFrequency):
+			if owned, err := maintenance.IsOwnedByThisUser(ctx, rep); err == nil && !owned {
+				// maintenance not owned by this user, don't run, but keep trying because
+				// maintenance ownership MAY change to this user in the future.
+				continue
+			}
+
 			if err := s.taskmgr.Run(ctx, "Maintenance", "Periodic maintenance", func(ctx context.Context, _ uitask.Controller) error {
 				return periodicMaintenanceOnce(ctx, rep)
 			}); err != nil {
@@ -503,9 +511,11 @@ func periodicMaintenanceOnce(ctx context.Context, rep repo.Repository) error {
 		return errors.Errorf("not a direct repository")
 	}
 
+	// nolint:wrapcheck
 	return repo.DirectWriteSession(ctx, dr, repo.WriteSessionOptions{
 		Purpose: "periodicMaintenanceOnce",
-	}, func(w repo.DirectRepositoryWriter) error {
+	}, func(ctx context.Context, w repo.DirectRepositoryWriter) error {
+		// nolint:wrapcheck
 		return snapshotmaintenance.Run(ctx, w, maintenance.ModeAuto, false, maintenance.SafetyFull)
 	})
 }
@@ -604,6 +614,7 @@ type Options struct {
 	MaxConcurrency       int
 	Authenticator        auth.Authenticator
 	Authorizer           auth.Authorizer
+	PasswordPersist      passwordpersist.Strategy
 	AuthCookieSigningKey string
 	UIUser               string // name of the user allowed to access the UI
 }
@@ -613,6 +624,10 @@ type Options struct {
 func New(ctx context.Context, options Options) (*Server, error) {
 	if options.Authorizer == nil {
 		return nil, errors.Errorf("missing authorizer")
+	}
+
+	if options.PasswordPersist == nil {
+		return nil, errors.Errorf("missing password persistence")
 	}
 
 	if options.AuthCookieSigningKey == "" {

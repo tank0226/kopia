@@ -142,14 +142,16 @@ func TestManifestInitCorruptedBlock(t *testing.T) {
 	st := blobtesting.NewMapStorage(data, nil, nil)
 
 	f := &content.FormattingOptions{
-		Hash:        hashing.DefaultAlgorithm,
-		Encryption:  encryption.DefaultAlgorithm,
-		MaxPackSize: 100000,
-		Version:     1,
+		Hash:       hashing.DefaultAlgorithm,
+		Encryption: encryption.DefaultAlgorithm,
+		MutableParameters: content.MutableParameters{
+			MaxPackSize: 100000,
+		},
+		Version: 1,
 	}
 
 	// write some data to storage
-	bm, err := content.NewManager(ctx, st, f, nil, nil)
+	bm, err := content.NewManagerForTesting(ctx, st, f, nil, nil)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -179,7 +181,7 @@ func TestManifestInitCorruptedBlock(t *testing.T) {
 	}
 
 	// make a new content manager based on corrupted data.
-	bm, err = content.NewManager(ctx, st, f, nil, nil)
+	bm, err = content.NewManagerForTesting(ctx, st, f, nil, nil)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -302,11 +304,13 @@ func newManagerForTesting(ctx context.Context, t *testing.T, data blobtesting.Da
 
 	st := blobtesting.NewMapStorage(data, nil, nil)
 
-	bm, err := content.NewManager(ctx, st, &content.FormattingOptions{
-		Hash:        hashing.DefaultAlgorithm,
-		Encryption:  encryption.DefaultAlgorithm,
-		MaxPackSize: 100000,
-		Version:     1,
+	bm, err := content.NewManagerForTesting(ctx, st, &content.FormattingOptions{
+		Hash:       hashing.DefaultAlgorithm,
+		Encryption: encryption.DefaultAlgorithm,
+		MutableParameters: content.MutableParameters{
+			MaxPackSize: 100000,
+		},
+		Version: 1,
 	}, nil, nil)
 	if err != nil {
 		t.Fatalf("can't create content manager: %v", err)

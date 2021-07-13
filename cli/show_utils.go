@@ -7,33 +7,20 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"os"
 	"time"
 
-	"github.com/alecthomas/kingpin"
 	"github.com/pkg/errors"
 
 	"github.com/kopia/kopia/internal/iocopy"
 	"github.com/kopia/kopia/internal/units"
 )
 
-var (
-	commonIndentJSON bool
-	commonUnzip      bool
+const oneHundredPercent = 100.0
 
-	timeZone = app.Flag("timezone", "Format time according to specified time zone (local, utc, original or time zone name)").Default("local").Hidden().String()
-)
+// TODO - remove this global.
+var timeZone = "local"
 
-func setupShowCommand(cmd *kingpin.CmdClause) {
-	cmd.Flag("json", "Pretty-print JSON content").Short('j').BoolVar(&commonIndentJSON)
-	cmd.Flag("unzip", "Transparently unzip the content").Short('z').BoolVar(&commonUnzip)
-}
-
-func showContent(rd io.Reader) error {
-	return showContentWithFlags(rd, commonUnzip, commonIndentJSON)
-}
-
-func showContentWithFlags(rd io.Reader, unzip, indentJSON bool) error {
+func showContentWithFlags(w io.Writer, rd io.Reader, unzip, indentJSON bool) error {
 	if unzip {
 		gz, err := gzip.NewReader(rd)
 		if err != nil {
@@ -57,7 +44,7 @@ func showContentWithFlags(rd io.Reader, unzip, indentJSON bool) error {
 		rd = ioutil.NopCloser(&buf2)
 	}
 
-	if _, err := iocopy.Copy(os.Stdout, rd); err != nil {
+	if _, err := iocopy.Copy(w, rd); err != nil {
 		return errors.Wrap(err, "error copying data")
 	}
 
@@ -89,7 +76,7 @@ func formatTimestampPrecise(ts time.Time) string {
 }
 
 func convertTimezone(ts time.Time) time.Time {
-	switch *timeZone {
+	switch timeZone {
 	case "local":
 		return ts.Local()
 	case "utc":
@@ -97,11 +84,23 @@ func convertTimezone(ts time.Time) time.Time {
 	case "original":
 		return ts
 	default:
-		loc, err := time.LoadLocation(*timeZone)
+		loc, err := time.LoadLocation(timeZone)
 		if err == nil {
 			return ts.In(loc)
 		}
 
 		return ts
 	}
+}
+
+func formatCompressionPercentage(original, compressed int64) string {
+	if compressed >= original {
+		return "0%"
+	}
+
+	if original == 0 {
+		return "0%"
+	}
+
+	return fmt.Sprintf("%.1f%%", oneHundredPercent*(1-float64(compressed)/float64(original)))
 }

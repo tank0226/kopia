@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/kopia/kopia/internal/clock"
 	"github.com/kopia/kopia/tests/robustness"
@@ -97,7 +98,10 @@ type Engine struct {
 
 	RunStats        Stats
 	CumulativeStats Stats
-	EngineLog       Log
+	statsMux        sync.RWMutex
+
+	EngineLog Log
+	logMux    sync.RWMutex
 }
 
 // Shutdown makes a last snapshot then flushes the metadata and prints the final statistics.
@@ -130,17 +134,17 @@ func (e *Engine) Shutdown(ctx context.Context) error {
 	defer e.cleanComponents()
 
 	if e.MetaStore != nil {
-		err := e.saveLog()
+		err := e.saveLog(ctx)
 		if err != nil {
 			return err
 		}
 
-		err = e.saveStats()
+		err = e.saveStats(ctx)
 		if err != nil {
 			return err
 		}
 
-		err = e.saveSnapIDIndex()
+		err = e.saveSnapIDIndex(ctx)
 		if err != nil {
 			return err
 		}
@@ -189,19 +193,19 @@ func (e *Engine) Init(ctx context.Context) error {
 		return err
 	}
 
-	err = e.loadStats()
+	err = e.loadStats(ctx)
 	if err != nil {
 		return err
 	}
 
 	e.CumulativeStats.RunCounter++
 
-	err = e.loadLog()
+	err = e.loadLog(ctx)
 	if err != nil {
 		return err
 	}
 
-	err = e.loadSnapIDIndex()
+	err = e.loadSnapIDIndex(ctx)
 	if err != nil {
 		return err
 	}

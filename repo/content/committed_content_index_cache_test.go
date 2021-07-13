@@ -11,6 +11,7 @@ import (
 	"github.com/kopia/kopia/internal/testlogging"
 	"github.com/kopia/kopia/internal/testutil"
 	"github.com/kopia/kopia/repo/blob"
+	"github.com/kopia/kopia/repo/logging"
 )
 
 func TestCommittedContentIndexCache_Disk(t *testing.T) {
@@ -18,7 +19,7 @@ func TestCommittedContentIndexCache_Disk(t *testing.T) {
 
 	ta := faketime.NewClockTimeWithOffset(0)
 
-	testCache(t, &diskCommittedContentIndexCache{testutil.TempDirectory(t), ta.NowFunc(), 3}, ta)
+	testCache(t, &diskCommittedContentIndexCache{testutil.TempDirectory(t), ta.NowFunc(), 3, logging.Printf(t.Logf)("test")}, ta)
 }
 
 func TestCommittedContentIndexCache_Memory(t *testing.T) {
@@ -46,8 +47,8 @@ func testCache(t *testing.T, cache committedContentIndexCache, fakeTime *faketim
 	}
 
 	require.NoError(t, cache.addContentToCache(ctx, "ndx1", mustBuildPackIndex(t, packIndexBuilder{
-		"c1": &Info{PackBlobID: "p1234", ID: "c1"},
-		"c2": &Info{PackBlobID: "p1234", ID: "c2"},
+		"c1": &InfoStruct{PackBlobID: "p1234", ContentID: "c1"},
+		"c2": &InfoStruct{PackBlobID: "p1234", ContentID: "c2"},
 	})))
 
 	has, err = cache.hasIndexBlobID(ctx, "ndx1")
@@ -58,13 +59,13 @@ func testCache(t *testing.T, cache committedContentIndexCache, fakeTime *faketim
 	}
 
 	require.NoError(t, cache.addContentToCache(ctx, "ndx2", mustBuildPackIndex(t, packIndexBuilder{
-		"c3": &Info{PackBlobID: "p2345", ID: "c3"},
-		"c4": &Info{PackBlobID: "p2345", ID: "c4"},
+		"c3": &InfoStruct{PackBlobID: "p2345", ContentID: "c3"},
+		"c4": &InfoStruct{PackBlobID: "p2345", ContentID: "c4"},
 	})))
 
 	require.NoError(t, cache.addContentToCache(ctx, "ndx2", mustBuildPackIndex(t, packIndexBuilder{
-		"c3": &Info{PackBlobID: "p2345", ID: "c3"},
-		"c4": &Info{PackBlobID: "p2345", ID: "c4"},
+		"c3": &InfoStruct{PackBlobID: "p2345", ContentID: "c3"},
+		"c4": &InfoStruct{PackBlobID: "p2345", ContentID: "c4"},
 	})))
 
 	ndx1, err := cache.openIndex(ctx, "ndx1")
@@ -76,7 +77,7 @@ func testCache(t *testing.T, cache committedContentIndexCache, fakeTime *faketim
 	i, err := ndx1.GetInfo("c1")
 	require.NoError(t, err)
 
-	if got, want := i.PackBlobID, blob.ID("p1234"); got != want {
+	if got, want := i.GetPackBlobID(), blob.ID("p1234"); got != want {
 		t.Fatalf("unexpected pack blob ID: %v, want %v", got, want)
 	}
 
@@ -85,7 +86,7 @@ func testCache(t *testing.T, cache committedContentIndexCache, fakeTime *faketim
 	i, err = ndx2.GetInfo("c3")
 	require.NoError(t, err)
 
-	if got, want := i.PackBlobID, blob.ID("p2345"); got != want {
+	if got, want := i.GetPackBlobID(), blob.ID("p2345"); got != want {
 		t.Fatalf("unexpected pack blob ID: %v, want %v", got, want)
 	}
 
@@ -116,7 +117,7 @@ func mustBuildPackIndex(t *testing.T, b packIndexBuilder) []byte {
 	t.Helper()
 
 	var buf bytes.Buffer
-	if err := b.Build(&buf); err != nil {
+	if err := b.Build(&buf, v2IndexVersion); err != nil {
 		t.Fatal(err)
 	}
 

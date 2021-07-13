@@ -20,6 +20,12 @@ type Params struct {
 
 	QuickCycle CycleParams `json:"quick"`
 	FullCycle  CycleParams `json:"full"`
+
+	LogRetention LogRetentionOptions `json:"logRetention"`
+}
+
+func (p *Params) isOwnedByByThisUser(rep repo.Repository) bool {
+	return p.Owner == rep.ClientOptions().UsernameAtHost()
 }
 
 // DefaultParams represents default values of maintenance parameters.
@@ -33,6 +39,7 @@ func DefaultParams() Params {
 			Enabled:  true,
 			Interval: 1 * time.Hour,
 		},
+		LogRetention: defaultLogRetention(),
 	}
 }
 
@@ -50,6 +57,16 @@ func HasParams(ctx context.Context, rep repo.Repository) (bool, error) {
 	}
 
 	return len(md) > 0, nil
+}
+
+// IsOwnedByThisUser determines whether current user is the maintenance owner.
+func IsOwnedByThisUser(ctx context.Context, rep repo.Repository) (bool, error) {
+	p, err := GetParams(ctx, rep)
+	if err != nil {
+		return false, errors.Wrap(err, "error getting maintenance params")
+	}
+
+	return p.isOwnedByByThisUser(rep), nil
 }
 
 // GetParams returns repository-wide maintenance parameters.

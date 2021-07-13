@@ -4,16 +4,20 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/kopia/kopia/internal/blobtesting"
 	"github.com/kopia/kopia/internal/testlogging"
 	"github.com/kopia/kopia/repo/blob"
 )
 
-func TestContentIndexRecovery(t *testing.T) {
+func (s *contentManagerSuite) TestContentIndexRecovery(t *testing.T) {
 	ctx := testlogging.Context(t)
 	data := blobtesting.DataMap{}
 	keyTime := map[blob.ID]time.Time{}
-	bm := newTestContentManager(t, data, keyTime, nil)
+	st := blobtesting.NewMapStorage(data, keyTime, nil)
+
+	bm := s.newTestContentManagerWithCustomTime(t, st, nil)
 
 	content1 := writeContentAndVerify(ctx, t, bm, seededRandomData(10, 100))
 	content2 := writeContentAndVerify(ctx, t, bm, seededRandomData(11, 100))
@@ -24,15 +28,20 @@ func TestContentIndexRecovery(t *testing.T) {
 	}
 
 	// delete all index blobs
-	assertNoError(t, bm.st.ListBlobs(ctx, indexBlobPrefix, func(bi blob.Metadata) error {
-		log(ctx).Debugf("deleting %v", bi.BlobID)
+	require.NoError(t, bm.st.ListBlobs(ctx, IndexBlobPrefix, func(bi blob.Metadata) error {
+		t.Logf("deleting %v", bi.BlobID)
+		return bm.st.DeleteBlob(ctx, bi.BlobID)
+	}))
+
+	require.NoError(t, bm.st.ListBlobs(ctx, "x", func(bi blob.Metadata) error {
+		t.Logf("deleting %v", bi.BlobID)
 		return bm.st.DeleteBlob(ctx, bi.BlobID)
 	}))
 
 	bm.Close(ctx)
 
 	// now with index blobs gone, all contents appear to not be found
-	bm = newTestContentManager(t, data, keyTime, nil)
+	bm = s.newTestContentManagerWithCustomTime(t, st, nil)
 	defer bm.Close(ctx)
 
 	verifyContentNotFound(ctx, t, bm, content1)
@@ -49,7 +58,7 @@ func TestContentIndexRecovery(t *testing.T) {
 				return err
 			}
 			totalRecovered += len(infos)
-			log(ctx).Debugf("recovered %v contents", len(infos))
+			t.Logf("recovered %v contents", len(infos))
 			return nil
 		})
 		if err != nil {
@@ -76,7 +85,7 @@ func TestContentIndexRecovery(t *testing.T) {
 				return rerr
 			}
 			totalRecovered += len(infos)
-			log(ctx).Debugf("recovered %v contents", len(infos))
+			t.Logf("recovered %v contents", len(infos))
 			return nil
 		})
 		if err != nil {

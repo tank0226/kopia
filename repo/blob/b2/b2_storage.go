@@ -74,6 +74,7 @@ func (s *b2Storage) GetBlob(ctx context.Context, id blob.ID, offset, length int6
 		return nil, translateError(err)
 	}
 
+	// nolint:wrapcheck
 	return blob.EnsureLengthExactly(fetched, length)
 }
 
@@ -224,6 +225,10 @@ func (s *b2Storage) DisplayName() string {
 }
 
 func (s *b2Storage) Close(ctx context.Context) error {
+	return nil
+}
+
+func (s *b2Storage) FlushCaches(ctx context.Context) error {
 	return nil
 }
 
