@@ -106,7 +106,7 @@ jobs:
     - name: Publish Coverage Results
       run: make ci-publish-coverage
     - name: Upload Kopia Artifacts
-      uses: actions/upload-artifact@v2
+      uses: actions/upload-artifact@v3
       with:
         name: kopia
         path: |
@@ -127,7 +127,7 @@ jobs:
           dist/kopia-ui/*.yml
         if-no-files-found: ignore
     - name: Upload Kopia Binary
-      uses: actions/upload-artifact@v2
+      uses: actions/upload-artifact@v3
       with:
         name: kopia_binaries
         path: |
